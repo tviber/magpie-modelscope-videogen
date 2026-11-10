@@ -1,0 +1,13 @@
+{
+  "name": "magpie-modelscope-wan",
+  "version": "0.1.0",
+  "description": "Magpie tools for submitting ModelScope WAN video jobs through local browser sessions",
+  "repository": { "type": "git", "url": "git+https://github.com/tviber/magpie-modelscope-wan.git" },
+  "type": "module",
+  "dependencies": { "@opencode-ai/plugin": "1.3.3" },
+  "scripts": { "test": "node --test --test-concurrency=1 tests/test_plugin.mjs" },
+  "main": "./index.mjs",
+  "files": ["index.mjs", "README.md", "PRIVACY.md", "pyproject.toml", "src/magpie_wan/*.py"],
+  "keywords": ["magpie", "opencode", "opencode-plugin", "tools", "modelscope", "wan"],
+  "engines": { "node": ">=20" }
+}

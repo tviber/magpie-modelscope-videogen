@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "magpie-wan-service"
+version = "0.1.0"
+description = "Local ModelScope WAN job service for Magpie tools"
+requires-python = ">=3.11"
+dependencies = [
+  "Pillow>=11,<13",
+  "playwright>=1.55,<2",
+  "requests>=2.32,<3",
+]
+
+[project.scripts]
+magpie-wan-service = "magpie_wan.service:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.optional-dependencies]
+test = ["pytest>=8.3,<9"]

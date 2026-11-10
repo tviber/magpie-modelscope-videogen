@@ -1,0 +1,55 @@
+name: Offline tests and clean package install
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  offline:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build and inspect the distribution
+        run: |
+          npm pack --json > pack.json
+          python - <<'PY'
+          import json
+          info = json.load(open('pack.json'))[0]
+          expected = {'index.mjs', 'package.json', 'README.md', 'PRIVACY.md', 'pyproject.toml',
+                      'src/magpie_wan/__init__.py', 'src/magpie_wan/provider.py',
+                      'src/magpie_wan/service.py', 'src/magpie_wan/media.py'}
+          assert {f['path'] for f in info['files']} == expected
+          PY
+      - name: Install only the tarball into an isolated project
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, subprocess
+          temp = pathlib.Path(os.environ['RUNNER_TEMP']) / 'wan-clean'
+          temp.mkdir()
+          (temp / 'package.json').write_text('{"private":true,"type":"module"}')
+          archive = pathlib.Path(json.load(open('pack.json'))[0]['filename']).resolve()
+          npm = 'npm.cmd' if os.name == 'nt' else 'npm'
+          subprocess.run([npm, 'install', '--ignore-scripts', '--no-audit', '--no-fund',
+                          '--cache', str(temp / 'cache'), str(archive)], cwd=temp, check=True)
+          package = temp / 'node_modules/magpie-modelscope-wan'
+          with open(os.environ['GITHUB_ENV'], 'a') as env:
+              env.write('WAN_TEST_PLUGIN=' + (package / 'index.mjs').as_uri() + '\n')
+              env.write('WAN_PACKAGED_SOURCE=' + str(package) + '\n')
+          PY
+      - name: Test packaged JavaScript tools
+        run: node --test --test-concurrency=1 tests/test_plugin.mjs
+      - name: Install packaged Python service and run offline tests
+        run: |
+          python -m pip install "${WAN_PACKAGED_SOURCE}[test]"
+          python -m pytest -q
+          magpie-wan-service --help

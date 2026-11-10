@@ -1,0 +1,22 @@
+# Privacy and data handling
+
+## What runs where
+
+- The Magpie plugin sends tool arguments only to the configured WAN service URL. By default this is `http://127.0.0.1:8765`.
+- The Python service reads input images only from directories explicitly listed in `WAN_MEDIA_ROOTS`, then sends the prompt and resized frame images to ModelScope through the configured signed-in browser session.
+- The service downloads the resulting video from the provider and serves it from its loopback HTTP endpoint.
+- This package has no analytics, telemetry, or background upload service.
+
+ModelScope receives the prompt, style/negative-prompt fields if supplied, and frame images because it performs the generation. Do not submit material you do not want sent to ModelScope.
+
+## Local data
+
+The service stores prompts, copied input frames, job state, provider task identifiers, and completed videos in its application data directory. It sets the directory permissions to owner-only and files to owner read/write where supported. SQLite stores stable account IDs, salted login fingerprints and their local salt. It does not store browser CDP endpoint URLs, raw account identities or login credentials. Use generic account IDs such as `account-1`, since they are visible in tool responses. Keep the entire database when migrating so identity checks remain effective. Signed provider download URLs may remain in unfinished job records until refreshed or completed; treat the whole data directory as private.
+
+Status responses do not include absolute input or output paths. The result tool performs an authenticated download to the plugin host's `~/.magpie-wan/results` (or its configured `outputDir`) and returns that absolute local artifact path and file URL to the calling agent. This intentionally reveals the artifact location, which may include a home-directory name. Completed copies remain until deleted; failed partial copies are removed. The long-lived service token stays in request headers, never in result URLs. Service errors and logs avoid printing prompts, raw login identities, browser endpoints, or file paths. Local CDP endpoints and the bearer token are read from environment variables and local plugin options; do not commit them to a repository or paste them into public issues.
+
+Only exact official ModelScope HTTPS page hosts are accepted. API calls use absolute trusted URLs through the browser context's HTTP client with redirects disabled. Upload destinations are restricted to official ModelScope HTTPS hosts and bucket-specific Alibaba OSS HTTPS endpoints, with upload redirects disabled.
+
+## Package contents
+
+The standalone package contains only the generic WAN adapter, Magpie tools, package metadata, and documentation. Tests and CI configuration remain in the source repository. The distribution does not include unrelated projects, media, user configuration, browser profiles, account data, or credentials. Review the package file list before publishing a release.
