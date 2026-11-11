@@ -22,6 +22,26 @@ class SubmissionRejected(RuntimeError):
 MODELSCOPE_HOSTS = {"modelscope.cn", "www.modelscope.cn"}
 
 
+class ModelScopeAPIError(RuntimeError):
+    """An API rejection, with a safe, user-facing explanation and endpoint name."""
+
+    def __init__(self, endpoint, status, code=None):
+        self.endpoint = endpoint
+        self.status = status
+        self.code = code
+        if status == 401 and endpoint == "/api/v1/users/login/info":
+            message = ("ModelScope rejected this browser session (HTTP 401). The profile may show a cached username; "
+                       "reload this browser profile and sign in again if ModelScope asks.")
+        elif status == 401 and endpoint == "/openapi/v1/magicubes/balance":
+            message = ("ModelScope rejected the magicube balance request (HTTP 401). "
+                       "The browser login session may need to be refreshed.")
+        else:
+            message = f"ModelScope request {endpoint} failed (HTTP {status})"
+            if code:
+                message += f" [{code}]"
+        super().__init__(message)
+
+
 def trusted_url(url, *, upload=False):
     """Accept only official HTTPS origins; OSS uploads may not redirect."""
     try:
@@ -115,7 +135,13 @@ class MS:
             origin + path, max_redirects=0, timeout=30_000, **kwargs)
         try:
             if not response.ok:
-                raise RuntimeError("ModelScope API request failed")
+                code = None
+                try:
+                    payload = response.json()
+                    code = payload.get("Code") or payload.get("code")
+                except Exception:
+                    pass
+                raise ModelScopeAPIError(path, response.status, code)
             return response.json()
         finally:
             response.dispose()
@@ -240,9 +266,15 @@ def connect(playwright, cdp, default_size=None):
     pages = [page for context in browser.contexts for page in context.pages if trusted_url(page.url)]
     if not pages:
         raise RuntimeError("Open an official ModelScope HTTPS page in the signed-in browser session")
+    failures = []
     for page in pages:
         try:
             return MS(page, cdp, default_size=default_size)
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, ModelScopeAPIError):
+                failures.append(str(exc))
+            else:
+                failures.append(f"ModelScope page could not initialize ({type(exc).__name__})")
             continue
-    raise RuntimeError("No usable signed-in ModelScope page found in this browser session")
+    detail = "; ".join(dict.fromkeys(failures))
+    raise RuntimeError(f"No usable ModelScope session was found. {detail}")

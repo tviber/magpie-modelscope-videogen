@@ -67,6 +67,25 @@ def test_navigation_and_changed_login_block_mutations():
     page.request.post.assert_not_called()
 
 
+def test_api_401_preserves_endpoint_and_login_guidance():
+    page = page_with_identity(123)
+
+    def unauthorized(*_args, **_kwargs):
+        response = Mock(ok=False, status=401)
+        response.json.return_value = {"Code": "Unauthorized"}
+        response.dispose = Mock()
+        return response
+
+    page.request.get.side_effect = unauthorized
+    client = provider.MS.__new__(provider.MS)
+    client.pg = page
+    with pytest.raises(provider.ModelScopeAPIError, match="browser session") as error:
+        client.identity()
+    assert error.value.endpoint == "/api/v1/users/login/info"
+    assert error.value.status == 401
+    assert error.value.code == "Unauthorized"
+
+
 @pytest.mark.parametrize("url", ["https://evil.org/image", "http://bucket.oss-cn-hangzhou.aliyuncs.com/a",
                                     "https://bucket.oss-cn-hangzhou.aliyuncs.com.evil.org/a"])
 def test_upload_rejects_untrusted_destination(tmp_path, monkeypatch, url):

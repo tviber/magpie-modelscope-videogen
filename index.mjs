@@ -319,7 +319,8 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(account)) return { type: "failed", error: "请填写 WAN_MODELSCOPE_ACCOUNTS 中的账号 ID" }
     try {
       const profile = await request(options, `/v1/accounts/${encodeURIComponent(account)}`, { signal })
-      if (profile.status !== "connected" || profile.stale) return { type: "failed", error: "请先启动 WAN 服务，并在对应浏览器登录 ModelScope，等待账号刷新" }
+      if (profile.status !== "connected" || profile.stale) return { type: "failed",
+        error: profile.session_error || (profile.stale ? "账号状态尚未刷新，请检查 WAN 服务和浏览器登录" : "ModelScope 账号暂不可用") }
       return { type: "success", key: account, metadata: { email: `${profile.label} · ${account}`, wan_account: account } }
     } catch (error) { return { type: "failed", error: error.message } }
   }
@@ -344,7 +345,9 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
         if (!account) return { error: "请先连接本机 ModelScope 账号", windows: [] }
         const profile = await request(options, `/v1/accounts/${encodeURIComponent(account)}`, { signal })
         const user = `${profile.label || account} · ${account}`
-        if (profile.status !== "connected" || profile.stale) return { user, error: "账号暂不可用或余额已过期；请检查本机服务与浏览器登录", windows: [] }
+        if (profile.status !== "connected" || profile.stale) return { user,
+          signIn: profile.session_error ? "expired" : undefined,
+          error: profile.session_error || (profile.stale ? "账号状态尚未刷新，请检查 WAN 服务和浏览器登录" : "ModelScope 账号暂不可用"), windows: [] }
         if (typeof profile.balance !== "number" || !Number.isFinite(profile.balance)) return { user, error: profile.balance_error || "魔粒余额暂不可用", windows: [] }
         return { user, plan: "ModelScope WAN", balance: `${profile.balance} 魔粒`,
           windows: [{ name: "可用魔粒", balance: profile.balance, unit: "魔粒", display: `${profile.balance} 魔粒` }] }

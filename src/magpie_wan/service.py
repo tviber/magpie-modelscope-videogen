@@ -462,7 +462,8 @@ class WanService:
         self._profile_lock = threading.Lock()
         self.account_profiles = {account: {"id": account, "label": account, "balance": None,
                                           "status": "connecting", "checked_at": None,
-                                          "unit": "魔粒", "balance_error": None}
+                                          "unit": "魔粒", "balance_error": None,
+                                          "session_error": None}
                                  for account in self.accounts}
         self.store.configure_accounts(self.accounts)
         self.media_roots = configured_roots
@@ -517,13 +518,16 @@ class WanService:
             balance = float(raw)
             if not math.isfinite(balance) or balance < 0:
                 raise ValueError("Invalid available balance")
-        except Exception:
-            balance, balance_error = None, "魔粒余额暂不可用；稍后自动重试"
+        except Exception as exc:
+            balance = None
+            balance_error = str(exc) if isinstance(exc, RuntimeError) and "ModelScope" in str(exc) \
+                else "魔粒余额暂不可用；稍后自动重试"
         self.store.verify_identity(account, ms.identity())
         with self._profile_lock:
             self.account_profiles[account] = {
                 "id": account, "label": label, "balance": balance, "unit": "魔粒",
-                "status": "connected", "checked_at": time.time(), "balance_error": balance_error}
+                "status": "connected", "checked_at": time.time(), "balance_error": balance_error,
+                "session_error": None}
 
     def validate_frames(self, body):
         if not body.get("first_frame"):
@@ -835,10 +839,13 @@ class WanService:
                         self.stop_event.wait(self.poll_seconds)
             except (Exception, SystemExit) as exc:
                 with self._profile_lock:
+                    detail = str(exc) if isinstance(exc, RuntimeError) and "ModelScope" in str(exc) else None
                     self.account_profiles[account] = {
-                        "id": account, "label": account, "balance": None, "unit": "魔粒",
+                        "id": account, "label": self.account_profiles[account].get("label") or account,
+                        "balance": None, "unit": "魔粒",
                         "status": "blocked" if isinstance(exc, ServiceError) else "unavailable",
-                        "checked_at": time.time(), "balance_error": "请检查浏览器登录、本机服务和账号绑定"}
+                        "checked_at": time.time(), "balance_error": None,
+                        "session_error": detail or "请检查浏览器登录、本机服务和账号绑定"}
                 if isinstance(exc, ServiceError) and exc.code in (
                         "account_identity_mismatch", "account_binding_required", "duplicate_account_identity"):
                     job = self.store.next_for_account(account)

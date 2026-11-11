@@ -113,6 +113,23 @@ test("one plugin export and independent account labels and magicube wallets", as
   assert.ok(unknown.error)
 })
 
+test("account connection and usage explain rejected browser sessions", async t => {
+  const profile = { id: "a", label: "Alice", status: "unavailable", balance: null, stale: false,
+    session_error: "ModelScope rejected this browser session (HTTP 401). Sign in again." }
+  const { plugin } = await fixture(t, (req, res) => {
+    if (req.url === "/v1/accounts") return res.end(JSON.stringify({ accounts: [profile] }))
+    res.end(JSON.stringify(profile))
+  }, { testAccounts: true })
+  const connect = await plugin.auth.methods[0].authorize()
+  assert.equal(connect.type, "failed")
+  assert.match(connect.error, /HTTP 401/)
+  const usage = await plugin.auth.usage(async () => ({ key: "a" }))
+  assert.equal(usage.user, "Alice · a")
+  assert.equal(usage.signIn, "expired")
+  assert.match(usage.error, /HTTP 401/)
+  assert.deepEqual(usage.windows, [])
+})
+
 test("result packages escaped preview, frame provenance, specifications and manifest", async t => {
   const seen = []
   const { tool } = await fixture(t, (req, res) => {

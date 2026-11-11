@@ -321,6 +321,12 @@ def test_accounts_publish_verified_labels_and_available_magicubes(tmp_path):
     service._refresh_account(ms, "account-1")
     assert service.account_snapshot("account-1")["balance"] is None
     assert service.account_snapshot("account-1")["balance_error"]
+    ms.balance.side_effect = provider.ModelScopeAPIError("/openapi/v1/magicubes/balance", 401)
+    service._refresh_account(ms, "account-1")
+    snapshot = service.account_snapshot("account-1")
+    assert snapshot["balance"] is None
+    assert "HTTP 401" in snapshot["balance_error"]
+    ms.balance.side_effect = None
     service.account_profiles["account-1"]["checked_at"] = time.time() - 121
     assert service.account_snapshot("account-1")["stale"]
     ms.identity.return_value = "Id:456"
