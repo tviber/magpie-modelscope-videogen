@@ -273,22 +273,21 @@ test("completion watcher resumes persisted tasks, downloads once and emits usefu
   })
   const state = join(outputDir, `watch-${createHash("sha256").update(opts.serverUrl).digest("hex").slice(0, 24)}.json`)
   await writeFile(state, JSON.stringify(["watched"]))
-  let notified
-  const received = new Promise(resolve => { notified = resolve })
-  await MagpieWanTools({ client: { tui: { showToast: async payload => { notifications.push(payload.body); notified() } } } }, opts)
-  // Drain the initial filesystem read before advancing the watch timer.
-  for (let i = 0; i < 30 && notifications.length === 0; i++) {
+  await MagpieWanTools({ client: { tui: { showToast: async payload => { notifications.push(payload.body) } } } }, opts)
+  // Filesystem completion is not tied to an event-loop iteration count, especially
+  // on Windows. Advance the watch timer until notified, then wait for the atomic
+  // state write, with a real deadline (performance is not mocked).
+  const deadline = performance.now() + 5_000
+  let saved
+  while (performance.now() < deadline) {
     await new Promise(resolve => setImmediate(resolve))
-    t.mock.timers.tick(15_000)
-  }
-  await received
-  for (let i = 0; i < 30; i++) {
-    await new Promise(resolve => setImmediate(resolve))
-    if ((await readFile(state, "utf8")) === "[]") break
+    if (notifications.length === 0) t.mock.timers.tick(15_000)
+    saved = JSON.parse(await readFile(state, "utf8"))
+    if (notifications.length && saved.length === 0) break
   }
   assert.equal(notifications.length, 1)
   assert.match(notifications[0].message, /5.06 秒 · 1280×736 · 16 fps/)
   assert.match(notifications[0].message, /A steady camera/)
   assert.match(notifications[0].message, /preview.html/)
-  assert.deepEqual(JSON.parse(await readFile(state, "utf8")), [])
+  assert.deepEqual(saved, [], "completed task must be removed from persisted watch state within 5 seconds")
 })
