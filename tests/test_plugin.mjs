@@ -95,6 +95,7 @@ test("one plugin export and independent account labels and magicube wallets", as
   await plugin.config(config)
   assert.deepEqual(config.provider["modelscope-wan"].models, {})
   assert.equal(plugin.auth.methods.length, 1)
+  assert.match(plugin.auth.icon, /^data:image\/png;base64,/)
   for (let i = 0; i < profiles.length; i++) {
     process.env.WAN_MAGPIE_CONNECT_ACCOUNT = profiles[i].id
     const login = await plugin.auth.methods[0].authorize()

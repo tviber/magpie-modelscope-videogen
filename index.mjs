@@ -6,7 +6,7 @@ import { homedir } from "node:os"
 import { basename, isAbsolute, join, relative, sep } from "node:path"
 import { Readable } from "node:stream"
 import { pipeline } from "node:stream/promises"
-import { pathToFileURL } from "node:url"
+import { fileURLToPath, pathToFileURL } from "node:url"
 import { execFile } from "node:child_process"
 import { promisify } from "node:util"
 import { setTimeout as delay } from "node:timers/promises"
@@ -343,6 +343,7 @@ async function saveMagpieAccount(account, options, signal) {
 
 export const MagpieWanTools = async (input = {}, options = {}) => {
   const watch = completionWatcher(input, options)
+  const icon = `data:image/png;base64,${await readFile(fileURLToPath(new URL("./assets/modelscope-icon.png", import.meta.url)), "base64")}`
   const connectAccount = async (account, signal) => {
     if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(account)) return { type: "failed", error: "请填写 WAN_MODELSCOPE_ACCOUNTS 中的账号 ID" }
     try {
@@ -399,6 +400,7 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
     },
     auth: {
       provider: PROVIDER,
+      icon,
       methods: [{ type: "api", keyless: true, label: "登录并同步浏览器账号", authorize: syncAccounts }],
       async usage(getAuth, _provider, { signal } = {}) {
         const auth = await getAuth()
