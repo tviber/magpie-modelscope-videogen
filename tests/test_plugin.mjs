@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url"
 import test from "node:test"
 
 const { MagpieWanTools, default: defaultPlugin } = await import(process.env.WAN_TEST_PLUGIN || "../index.mjs")
+// Capture before MockTimers is enabled: filesystem polling needs real time.
+const realTimeout = globalThis.setTimeout
 
 async function fixture(t, handler, options = {}) {
   const outputDir = await mkdtemp(join(tmpdir(), "wan-test-"))
@@ -280,7 +282,9 @@ test("completion watcher resumes persisted tasks, downloads once and emits usefu
   const deadline = performance.now() + 5_000
   let saved
   while (performance.now() < deadline) {
-    await new Promise(resolve => setImmediate(resolve))
+    // Do not continuously reopen the target while Windows is replacing it;
+    // an open reader can prevent the atomic rename there.
+    await new Promise(resolve => realTimeout(resolve, 25))
     if (notifications.length === 0) t.mock.timers.tick(15_000)
     saved = JSON.parse(await readFile(state, "utf8"))
     if (notifications.length && saved.length === 0) break
