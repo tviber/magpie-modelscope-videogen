@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import { chmod, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -94,9 +94,11 @@ test("one plugin export and independent account labels and magicube wallets", as
   const config = {}
   await plugin.config(config)
   assert.deepEqual(config.provider["modelscope-wan"].models, {})
-  assert.equal(plugin.auth.methods.length, 3)
+  assert.equal(plugin.auth.methods.length, 1)
   for (let i = 0; i < profiles.length; i++) {
-    const login = await plugin.auth.methods[i].authorize()
+    process.env.WAN_MAGPIE_CONNECT_ACCOUNT = profiles[i].id
+    const login = await plugin.auth.methods[0].authorize()
+    delete process.env.WAN_MAGPIE_CONNECT_ACCOUNT
     assert.equal(login.key, profiles[i].id)
     assert.equal(login.metadata.email, `${profiles[i].label} · ${profiles[i].id}`)
     const usage = await plugin.auth.usage(async () => ({ type: "api", key: login.key }))
@@ -104,6 +106,8 @@ test("one plugin export and independent account labels and magicube wallets", as
     assert.equal(usage.windows[0].unit, "魔粒")
     assert.equal(usage.windows[0].used, undefined)
   }
+  process.env.WAN_MAGPIE_CONNECT_ACCOUNT = "a"
+  t.after(() => { delete process.env.WAN_MAGPIE_CONNECT_ACCOUNT })
   profiles[0].stale = true
   assert.equal((await plugin.auth.methods[0].authorize()).type, "failed")
   assert.deepEqual((await plugin.auth.usage(async () => ({ key: "a" }))).windows, [])
@@ -120,6 +124,8 @@ test("account connection and usage explain rejected browser sessions", async t =
     if (req.url === "/v1/accounts") return res.end(JSON.stringify({ accounts: [profile] }))
     res.end(JSON.stringify(profile))
   }, { testAccounts: true })
+  process.env.WAN_MAGPIE_CONNECT_ACCOUNT = "a"
+  t.after(() => { delete process.env.WAN_MAGPIE_CONNECT_ACCOUNT })
   const connect = await plugin.auth.methods[0].authorize()
   assert.equal(connect.type, "failed")
   assert.match(connect.error, /HTTP 401/)
@@ -128,6 +134,51 @@ test("account connection and usage explain rejected browser sessions", async t =
   assert.equal(usage.signIn, "expired")
   assert.match(usage.error, /HTTP 401/)
   assert.deepEqual(usage.windows, [])
+})
+
+test("one click discovers fresh accounts and invokes Magpie login only for connected sessions", async t => {
+  if (process.platform === "win32") return t.skip("POSIX CLI fixture; live Magpie login is tested on macOS")
+  const directory = await mkdtemp(join(tmpdir(), "wan-login-"))
+  t.after(() => rm(directory, { recursive: true, force: true }))
+  const executable = join(directory, "magpie")
+  const log = join(directory, "accounts")
+  await writeFile(executable, `#!/bin/sh\n[ "$1" = plugin ] && [ "$2" = login ] && [ "$3" = modelscope-wan ] && [ "$4" = 1 ] || exit 2\nprintf '%s\\n' "$WAN_MAGPIE_CONNECT_ACCOUNT" >> '${log}'\n`)
+  await chmod(executable, 0o700)
+  let profiles = []
+  const { plugin } = await fixture(t, (req, res) => {
+    if (req.url === "/v1/accounts") return res.end(JSON.stringify({ accounts: profiles }))
+    res.end(JSON.stringify(profiles.find(p => req.url.endsWith(`/${p.id}`))))
+  }, { testAccounts: true, magpieExecutable: executable, loginWaitMs: 0 })
+  assert.equal(plugin.auth.methods.length, 1)
+  assert.equal(plugin.auth.methods[0].keyless, true)
+  // Accounts are added after initialization, just as after a browser login.
+  profiles = [
+    { id: "a", label: "Alice", status: "connected", balance: 300, stale: false },
+    { id: "b", label: "Bob", status: "connected", balance: 165, stale: false },
+    { id: "c", status: "unavailable", stale: false },
+    { id: "d", status: "connected", stale: true },
+  ]
+  const result = await plugin.auth.methods[0].authorize()
+  assert.equal(result.type, "success")
+  assert.equal(result.key, "a")
+  assert.equal(await readFile(log, "utf8"), "a\nb\n")
+  const controller = new AbortController()
+  controller.abort()
+  assert.equal((await plugin.auth.methods[0].authorize(undefined, { signal: controller.signal })).type, "failed")
+  assert.equal(await readFile(log, "utf8"), "a\nb\n")
+  await writeFile(executable, '#!/bin/sh\necho private-child-output >&2\nexit 1\n')
+  const failed = await plugin.auth.methods[0].authorize()
+  assert.equal(failed.type, "failed")
+  assert.ok(!failed.error.includes("private-child-output"))
+})
+
+test("login without a verified session explains the browser step and saves nothing", async t => {
+  const { plugin } = await fixture(t, (_req, res) => res.end(JSON.stringify({ accounts: [
+    { id: "a", status: "unavailable", session_error: "HTTP 401" },
+  ] })), { testAccounts: true, loginWaitMs: 0, magpieExecutable: "/does/not/exist" })
+  const result = await plugin.auth.methods[0].authorize()
+  assert.equal(result.type, "failed")
+  assert.match(result.error, /浏览器窗口登录/)
 })
 
 test("result packages escaped preview, frame provenance, specifications and manifest", async t => {
