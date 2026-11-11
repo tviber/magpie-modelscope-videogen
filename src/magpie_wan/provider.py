@@ -123,6 +123,22 @@ class MS:
     def identity(self):
         return login_identity(self._api("get", "/api/v1/users/login/info"))
 
+    def profile(self):
+        """Return a user-facing label without exposing cookies or CDP details."""
+        payload = self._api("get", "/api/v1/users/login/info")
+        if login_identity(payload) != self.expected_identity:
+            raise RuntimeError("ModelScope login identity changed; reconnect the original account")
+        data = payload.get("Data") or {}
+        for field in ("Email", "Username", "NickName", "Nickname", "Name"):
+            value = data.get(field)
+            if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+                return str(value).strip()
+        for field in ("Email", "Username", "NickName", "Nickname", "Name"):
+            value = (data.get("UserInfo") or {}).get(field) if isinstance(data.get("UserInfo"), dict) else None
+            if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value).strip():
+                return str(value).strip()
+        return "ModelScope"
+
     def _check_identity(self):
         if self.identity() != self.expected_identity:
             raise RuntimeError("ModelScope login identity changed; reconnect the original account")

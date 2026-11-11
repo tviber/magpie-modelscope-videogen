@@ -118,8 +118,27 @@ def test_public_job_uses_generic_account_label_and_no_local_path(tmp_path):
     assert "video_path" not in public
     assert public["output_path"].endswith("/video.mp4")
     assert not Path(public["output_path"]).is_absolute()
-    assert "first.png" not in str(public)
+    assert str(tmp_path) not in str(public)
+    assert public["input_frames"][0]["name"] == "first.png"
     assert public["content_url"].endswith(f"/{job['id']}/content")
+    service.stop()
+
+
+def test_public_job_reports_project_request_actual_and_phases(tmp_path):
+    frame = make_frame(tmp_path / "first.png")
+    service = make_service(tmp_path)
+    job, _ = service.submit({"prompt": "Camera move", "first_frame": str(frame), "seconds": 8,
+                             "size": "1280x720", "project": "MV one"})
+    queued = service.public_job(job)
+    assert queued["phase"] == "Waiting for an account worker"
+    assert queued["requested"] == {"seconds": 8, "size": "1280x720", "width": 1280, "height": 720, "fps": None}
+    assert queued["project"] == "MV one"
+    assert queued["prompt"] == "Camera move"
+    service.store.update(job["id"], status="completed", actual_metadata='{"duration": 5.06, "width": 1280, "height": 736, "fps": 16.0}')
+    actual = service.public_job(service.store.get(job["id"]))["actual"]
+    assert actual == {"duration": 5.06, "width": 1280, "height": 736, "fps": 16.0, "frame_count": None}
+    assert service.store.list_jobs(project="MV one")[0]["id"] == job["id"]
+    assert service.store.list_jobs(project="another") == []
     service.stop()
 
 
@@ -238,7 +257,7 @@ def test_download_failure_refreshes_original_task_and_unblocks_queue(tmp_path, m
     ms.status.return_value = {"status": "SUCCEED", "url": "https://example.org/fresh.mp4"}
     response.status_code = 200
     response._content = b"verified fixture"
-    monkeypatch.setattr(media, "save_video_bytes", lambda content, path: path.write_bytes(content))
+    monkeypatch.setattr(media, "save_video_bytes", lambda content, path, **_kwargs: path.write_bytes(content))
     service._poll_job(ms, service.store.get(job["id"]))
     ms.status.assert_called_once_with("original-task")
     ms.submit.assert_not_called()
@@ -277,3 +296,112 @@ def test_content_route_requires_bearer_and_serves_migrated_video(tmp_path):
         thread.join(timeout=3)
         server.server_close()
         service.stop()
+
+
+def test_accounts_publish_verified_labels_and_available_magicubes(tmp_path):
+    from unittest.mock import Mock
+    import time
+
+    service = make_service(tmp_path)
+    ms = Mock()
+    ms.identity.return_value = "Id:123"
+    ms.profile.return_value = "Test user"
+    ms.balance.return_value = {"total_balance": 200, "available_balance": 45, "frozen_amount": 155}
+    service._refresh_account(ms, "account-1")
+    snapshot = service.account_snapshot("account-1")
+    assert snapshot["balance"] == 45
+    assert snapshot["unit"] == "魔粒"
+    assert snapshot["label"] == "Test user"
+    assert snapshot["status"] == "connected"
+    assert not snapshot["stale"]
+    ms.balance.return_value = {"available_balance": 0}
+    service._refresh_account(ms, "account-1")
+    assert service.account_snapshot("account-1")["balance"] == 0
+    ms.balance.return_value = {"unrecognized": 20}
+    service._refresh_account(ms, "account-1")
+    assert service.account_snapshot("account-1")["balance"] is None
+    assert service.account_snapshot("account-1")["balance_error"]
+    service.account_profiles["account-1"]["checked_at"] = time.time() - 121
+    assert service.account_snapshot("account-1")["stale"]
+    ms.identity.return_value = "Id:456"
+    ms.profile.reset_mock()
+    with pytest.raises(ServiceError, match="identity mismatch"):
+        service._refresh_account(ms, "account-1")
+    ms.profile.assert_not_called()
+    service.stop()
+
+
+def test_project_idempotency_account_selection_and_honest_progress(tmp_path):
+    import time
+    frame = make_frame(tmp_path / "first.png")
+    service = make_service(tmp_path, {"a": "http://localhost:9223", "b": "http://localhost:9224"})
+    body = {"prompt": "Camera move", "first_frame": str(frame), "project": "MV", "shot": "Opening",
+            "idempotency_key": "opening", "account": "b"}
+    job, _ = service.submit(body)
+    assert job["account"] == "b"
+    assert service.submit(body)[1] is False
+    for changes in ({"project": "Other"}, {"shot": "Ending"}, {"account": "a"}):
+        with pytest.raises(ServiceError, match="different input"):
+            service.submit({**body, **changes})
+    public = service.public_job(job)
+    assert public["queue_position"] == 1
+    assert public["progress"] is None
+    assert public["estimated_remaining_seconds"] is None
+    service.store.update(job["id"], status="in_progress", last_polled_at=time.time() - 120)
+    public = service.public_job(service.store.get(job["id"]))
+    assert public["status_stale"]
+    assert public["poll_age_seconds"] >= 120
+    assert public["progress_kind"] == "indeterminate"
+    service.stop()
+
+
+def test_authenticated_config_preflight_pagination_and_frame_preview(tmp_path):
+    import threading
+    from http.server import ThreadingHTTPServer
+    import requests
+    from magpie_wan.service import make_handler
+
+    frame = make_frame(tmp_path / "first.png")
+    service = make_service(tmp_path)
+    jobs = [service.submit({"prompt": str(i), "first_frame": str(frame), "project": "MV"})[0]
+            for i in range(2)]
+    server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(service, "test-token"))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    headers = {"Authorization": "Bearer test-token"}
+    try:
+        for path in ("/v1/accounts", "/v1/media/roots", "/v1/videos", f"/v1/videos/{jobs[0]['id']}/frames/first_frame"):
+            assert requests.get(base + path, timeout=3).status_code == 401
+        assert requests.get(base + "/v1/media/roots", headers=headers, timeout=3).json()["roots"] == [str(tmp_path)]
+        assert requests.get(base + "/v1/accounts/missing", headers=headers, timeout=3).status_code == 404
+        valid = requests.post(base + "/v1/frames/validate", headers=headers, json={"first_frame": str(frame)}, timeout=3)
+        assert valid.json()["valid"] is True
+        assert len(service.store.list_jobs()) == 2
+        first = requests.get(base + "/v1/videos?project=MV&limit=1", headers=headers, timeout=3).json()
+        second = requests.get(base + f"/v1/videos?project=MV&limit=1&offset={first['next_offset']}", headers=headers, timeout=3).json()
+        assert first["data"][0]["id"] != second["data"][0]["id"]
+        assert second["next_offset"] is None
+        preview = requests.get(base + f"/v1/videos/{jobs[0]['id']}/frames/first_frame", headers=headers, timeout=3)
+        assert preview.headers["Content-Type"] == "image/png"
+        assert preview.content.startswith(b"\x89PNG")
+    finally:
+        server.shutdown()
+        thread.join(timeout=3)
+        server.server_close()
+        service.stop()
+
+
+def test_old_completed_job_specs_are_backfilled_without_changing_completion_time(tmp_path, monkeypatch):
+    from magpie_wan import media
+    service = make_service(tmp_path)
+    frame = make_frame(tmp_path / "first.png")
+    job, _ = service.submit({"prompt": "Motion", "first_frame": str(frame)})
+    output = service.store.jobs_dir / job["id"] / "video.mp4"
+    output.write_bytes(b"fixture")
+    service.store.update(job["id"], status="completed", result_path=service.store.relative_data_path(output))
+    old = service.store.get(job["id"])
+    monkeypatch.setattr(media, "validate_video_file", lambda _: {"duration": 5.0625, "width": 1280, "height": 736, "fps": 16})
+    assert service.job_details(old)["actual"]["fps"] == 16
+    assert service.store.get(job["id"])["updated_at"] == old["updated_at"]
+    service.stop()

@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+from fractions import Fraction
 from pathlib import Path
 
 
@@ -34,13 +35,15 @@ def validate_video_file(path, require_audio=False):
 
     try:
         result = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,duration:format=duration",
+            [ffprobe, "-v", "error", "-show_entries",
+             "stream=codec_type,duration,width,height,avg_frame_rate,r_frame_rate,nb_frames:format=duration",
              "-of", "json", str(path)],
             capture_output=True,
             text=True,
             check=False,
+            timeout=30,
         )
-    except OSError as exc:
+    except (OSError, subprocess.TimeoutExpired) as exc:
         raise InvalidVideoError(f"could not run ffprobe: {exc}") from exc
     if result.returncode != 0:
         detail = result.stderr.strip() or "ffprobe failed"
@@ -68,10 +71,26 @@ def validate_video_file(path, require_audio=False):
         seconds = 0
     if not math.isfinite(seconds) or seconds <= 0:
         raise InvalidVideoError(f"video duration is missing or invalid in {path}")
-    return {"duration": seconds, "streams": kinds}
+    video = next(stream for stream in streams if stream.get("codec_type") == "video")
+    fps = None
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        try:
+            rate = float(Fraction(str(video.get(key))))
+            if math.isfinite(rate) and rate > 0:
+                fps = rate
+                break
+        except (ValueError, ZeroDivisionError):
+            pass
+    try:
+        frame_count = int(video.get("nb_frames"))
+    except (TypeError, ValueError):
+        frame_count = None
+    return {"duration": seconds, "streams": sorted(kinds),
+            "width": video.get("width"), "height": video.get("height"),
+            "fps": fps, "frame_count": frame_count}
 
 
-def save_video_bytes(content, destination, require_audio=False):
+def save_video_bytes(content, destination, require_audio=False, *, metadata=None):
     """Write bytes to a temporary file, validate them, then atomically publish."""
     if not content:
         raise InvalidVideoError("downloaded video is empty")
@@ -86,8 +105,10 @@ def save_video_bytes(content, destination, require_audio=False):
             tmp.write(content)
             tmp.flush()
             os.fsync(tmp.fileno())
-        validate_video_file(tmp_path, require_audio=require_audio)
+        measured = validate_video_file(tmp_path, require_audio=require_audio)
         os.replace(tmp_path, destination)
+        if metadata is not None:
+            metadata.update(measured)
     finally:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)

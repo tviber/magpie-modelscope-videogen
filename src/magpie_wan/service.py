@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import shutil
@@ -26,7 +27,7 @@ else:
     import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from PIL import Image
 
@@ -45,6 +46,7 @@ MAX_FRAME_BYTES = 30 * 1024 * 1024
 MAX_PROMPT_CHARS = 20_000
 MAX_STYLE_CHARS = 4_000
 MAX_DURATION_SECONDS = 10
+MAX_PROJECT_CHARS = 160
 TERMINAL_PROVIDER_STATES = {"SUCCEED", "FAILED", "CANCELED"}
 ACTIVE_STATES = ("queued", "uploading", "submitting", "in_progress", "download_pending", "unknown_submission")
 PUBLIC_STATUS = {
@@ -60,10 +62,11 @@ PUBLIC_STATUS = {
 
 
 class ServiceError(ValueError):
-    def __init__(self, message, status=400, code="invalid_request_error"):
+    def __init__(self, message, status=400, code="invalid_request_error", details=None):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.details = details
 
 
 def default_data_dir():
@@ -168,7 +171,11 @@ def _validate_frame(value, roots):
     if not resolved.is_file():
         raise ServiceError("frame input is not a file")
     if not any(resolved == root or root in resolved.parents for root in roots):
-        raise ServiceError("frame file is outside WAN_MEDIA_ROOTS")
+        allowed = [str(root) for root in roots]
+        raise ServiceError(
+            f"frame file is outside WAN_MEDIA_ROOTS. Allowed directories: {', '.join(allowed)}. "
+            "Move the image there, or use copy_to_media_root=true in the Magpie submit tool.",
+            code="frame_outside_media_roots", details={"allowed_roots": allowed})
     if resolved.stat().st_size > MAX_FRAME_BYTES:
         raise ServiceError("frame file is larger than 30 MiB")
     try:
@@ -182,7 +189,8 @@ def _validate_frame(value, roots):
     return resolved, width, height
 
 
-def _fingerprint(first_frame, last_frame, prompt, model, seconds, width, height, style, negative_prompt, seed):
+def _fingerprint(first_frame, last_frame, prompt, model, seconds, width, height, style, negative_prompt, seed,
+                 project=None, shot=None, account=None):
     digest = hashlib.sha256()
     for image_path in (first_frame, last_frame):
         content = b"" if image_path is None else Path(image_path).read_bytes()
@@ -198,6 +206,10 @@ def _fingerprint(first_frame, last_frame, prompt, model, seconds, width, height,
         "negative_prompt": negative_prompt,
         "seed": seed,
     }
+    # Keep legacy hashes unchanged for requests without grouping or account selection.
+    for key, value in (("project", project), ("shot", shot), ("account", account)):
+        if value is not None:
+            fields[key] = value
     digest.update(json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
     return "sha256:" + digest.hexdigest()
 
@@ -269,12 +281,24 @@ class JobStore:
                 estimate TEXT,
                 provider_url TEXT,
                 result_path TEXT,
+                actual_metadata TEXT,
+                project TEXT,
                 error TEXT
             )""")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_queue ON jobs(account, status, created_at)")
             columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
             if "download_attempts" not in columns:
                 db.execute("ALTER TABLE jobs ADD COLUMN download_attempts INTEGER NOT NULL DEFAULT 0")
+            if "actual_metadata" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN actual_metadata TEXT")
+            if "project" not in columns:
+                db.execute("ALTER TABLE jobs ADD COLUMN project TEXT")
+            for name, kind in (("shot", "TEXT"), ("input_metadata", "TEXT"),
+                               ("last_polled_at", "REAL"), ("started_at", "REAL"),
+                               ("completed_at", "REAL")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
+            db.execute("CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project, created_at)")
             db.execute("""CREATE TABLE IF NOT EXISTS accounts (
                 id TEXT PRIMARY KEY, fingerprint TEXT UNIQUE, requires_binding INTEGER NOT NULL
             )""")
@@ -360,6 +384,25 @@ class JobStore:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return dict(row) if row else None
 
+    def list_jobs(self, project=None, limit=100, offset=0):
+        with self._connect() as db:
+            if project:
+                rows = db.execute("SELECT * FROM jobs WHERE project=? ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                                  (project, limit, offset)).fetchall()
+            else:
+                rows = db.execute("SELECT * FROM jobs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+                                  (limit, offset)).fetchall()
+        return [dict(row) for row in rows]
+
+    def queue_position(self, job):
+        if job["status"] != "queued":
+            return None
+        with self._connect() as db:
+            return db.execute("""SELECT COUNT(*) FROM jobs WHERE account=? AND
+                (status IN ('uploading','submitting','in_progress','download_pending','unknown_submission')
+                 OR (status='queued' AND (created_at<? OR (created_at=? AND id<=?))))""",
+                (job["account"], job["created_at"], job["created_at"], job["id"])).fetchone()[0]
+
     def update(self, job_id, **fields):
         if not fields:
             return
@@ -416,6 +459,11 @@ class WanService:
                                "service_already_running") from exc
         self.accounts = list(self.account_urls)
         self.account_labels = {account: account for account in self.accounts}
+        self._profile_lock = threading.Lock()
+        self.account_profiles = {account: {"id": account, "label": account, "balance": None,
+                                          "status": "connecting", "checked_at": None,
+                                          "unit": "魔粒", "balance_error": None}
+                                 for account in self.accounts}
         self.store.configure_accounts(self.accounts)
         self.media_roots = configured_roots
         self.poll_seconds = max(2, int(poll_seconds))
@@ -441,6 +489,52 @@ class WanService:
             raise ServiceError(f"model must be one of: {choices}")
         return model if model in MODEL_IDS else next(k for k, v in MODEL_IDS.items() if v == model)
 
+    def account_snapshot(self, account=None):
+        with self._profile_lock:
+            records = [dict(value) for value in self.account_profiles.values()]
+        now = time.time()
+        for value in records:
+            value["stale"] = value["checked_at"] is None or now - value["checked_at"] > 120
+            if value["stale"]:
+                value["balance"] = None
+        if account is None:
+            return records
+        result = next((value for value in records if value["id"] == account), None)
+        if result is None:
+            raise ServiceError("Account not found.", 404, "not_found_error")
+        return result
+
+    def _refresh_account(self, ms, account):
+        # Never publish a name/balance before verifying the bound browser identity.
+        self.store.verify_identity(account, ms.identity())
+        label = ms.profile()
+        balance, balance_error = None, None
+        try:
+            raw = ms.balance()
+            raw = raw.get("available_balance") if isinstance(raw, dict) else raw
+            if isinstance(raw, bool) or raw is None:
+                raise ValueError("No available balance")
+            balance = float(raw)
+            if not math.isfinite(balance) or balance < 0:
+                raise ValueError("Invalid available balance")
+        except Exception:
+            balance, balance_error = None, "魔粒余额暂不可用；稍后自动重试"
+        self.store.verify_identity(account, ms.identity())
+        with self._profile_lock:
+            self.account_profiles[account] = {
+                "id": account, "label": label, "balance": balance, "unit": "魔粒",
+                "status": "connected", "checked_at": time.time(), "balance_error": balance_error}
+
+    def validate_frames(self, body):
+        if not body.get("first_frame"):
+            raise ServiceError("first_frame is required")
+        frames = {}
+        for field in ("first_frame", "last_frame"):
+            if body.get(field) is not None:
+                _, width, height = _validate_frame(body[field], self.media_roots)
+                frames[field] = {"width": width, "height": height}
+        return {"valid": True, "frames": frames}
+
     def submit(self, body, idempotency_header=None):
         if not isinstance(body, dict):
             raise ServiceError("request body must be a JSON object")
@@ -449,6 +543,20 @@ class WanService:
             raise ServiceError("prompt must be a non-empty string")
         if len(prompt) > MAX_PROMPT_CHARS:
             raise ServiceError(f"prompt must be at most {MAX_PROMPT_CHARS} characters")
+        project = body.get("project")
+        if project is not None:
+            if not isinstance(project, str) or not project.strip() or len(project) > MAX_PROJECT_CHARS:
+                raise ServiceError(f"project must be a non-empty string of at most {MAX_PROJECT_CHARS} characters")
+            project = project.strip()
+        shot = body.get("shot")
+        if shot is not None:
+            if not isinstance(shot, str) or not shot.strip() or len(shot) > MAX_PROJECT_CHARS:
+                raise ServiceError("shot must be a non-empty string of at most 160 characters")
+            shot = shot.strip()
+        requested_account = body.get("account")
+        if requested_account is not None and (not isinstance(requested_account, str) or
+                                               requested_account not in self.accounts):
+            raise ServiceError("account must be one of the configured account IDs")
 
         first_value = body.get("first_frame", body.get("image"))
         if first_value is None:
@@ -492,6 +600,9 @@ class WanService:
         seed = body.get("seed", -1)
         if not isinstance(seed, int) or isinstance(seed, bool) or seed < -1 or seed > 2_147_483_647:
             raise ServiceError("seed must be -1 or a non-negative 32-bit integer")
+        supplied_metadata = body.get("input_metadata") or {}
+        if not isinstance(supplied_metadata, dict):
+            raise ServiceError("input_metadata must be an object")
         idempotency_key = idempotency_header or body.get("idempotency_key")
         if idempotency_key is not None:
             if not isinstance(idempotency_key, str) or not idempotency_key.strip() or len(idempotency_key) > 200:
@@ -499,7 +610,7 @@ class WanService:
             idempotency_key = idempotency_key.strip()
 
         fingerprint = _fingerprint(first_path, last_path, prompt, model, seconds, width, height,
-                                   style, negative_prompt, seed)
+                                   style, negative_prompt, seed, project, shot, requested_account)
         previous = self.store.get_by_idempotency(idempotency_key)
         if previous:
             if previous["input_fingerprint"] != fingerprint:
@@ -520,10 +631,20 @@ class WanService:
             shutil.copyfile(last_path, last_copy)
             last_copy.chmod(0o600)
         stored_fingerprint = _fingerprint(first_copy, last_copy, prompt, model, seconds, width, height,
-                                          style, negative_prompt, seed)
+                                          style, negative_prompt, seed, project, shot, requested_account)
 
         counts = self.store.active_counts(self.accounts)
-        account = min(self.accounts, key=lambda candidate: counts.get(candidate, 0))
+        account = requested_account or min(self.accounts, key=lambda candidate: counts.get(candidate, 0))
+        input_metadata = {}
+        for role, path, w, h in (("first_frame", first_path, source_w, source_h),
+                                 ("last_frame", last_path, last_w if last_path else None,
+                                  last_h if last_path else None)):
+            if path:
+                supplied = supplied_metadata.get(role) or {}
+                name = supplied.get("name") if isinstance(supplied, dict) else None
+                if not isinstance(name, str) or not name.strip() or len(name) > 255 or Path(name).name != name:
+                    name = path.name
+                input_metadata[role] = {"name": name, "width": w, "height": h}
         now = time.time()
         row = {
             "id": job_id,
@@ -543,6 +664,9 @@ class WanService:
             "input_fingerprint": stored_fingerprint,
             "idempotency_key": idempotency_key,
             "account": account,
+            "project": project,
+            "shot": shot,
+            "input_metadata": json.dumps(input_metadata, ensure_ascii=False),
         }
         try:
             self.store.insert(row)
@@ -558,38 +682,98 @@ class WanService:
     def public_job(self, job, base_path="/v1/videos"):
         internal_status = job["status"]
         status = PUBLIC_STATUS[internal_status]
-        progress = {
-            "queued": 0,
-            "uploading": 5,
-            "submitting": 10,
-            "in_progress": 50,
-            "download_pending": 95,
-            "unknown_submission": 10,
-            "completed": 100,
-            "failed": 0,
+        # ModelScope's status API does not promise a measured completion percent.
+        progress = 100 if internal_status == "completed" else None
+        phase = {
+            "queued": "Waiting for an account worker",
+            "uploading": "Uploading input frames",
+            "submitting": "Submitting to ModelScope",
+            "in_progress": "Generating on ModelScope",
+            "download_pending": "Fetching generated video",
+            "unknown_submission": "Submission needs reconciliation",
+            "completed": "Video ready",
+            "failed": "Generation failed",
         }[internal_status]
         estimate = json.loads(job["estimate"]) if job.get("estimate") else None
+        now = time.time()
+        last_poll = job.get("last_polled_at")
+        terminal = internal_status in ("completed", "failed")
+        elapsed_end = job.get("completed_at") or (job["updated_at"] if terminal else now)
         result = {
             "id": job["id"],
             "object": "video",
             "model": job["model"],
             "status": status,
             "progress": progress,
+            "phase": phase,
+            "progress_kind": "complete" if internal_status == "completed" else "indeterminate",
+            "progress_message": (job.get("error") or phase) + (
+                ". ModelScope does not provide a reliable percentage or remaining time."
+                if internal_status == "in_progress" else ""),
+            "estimated_remaining_seconds": None,
+            "elapsed_seconds": max(0, int(elapsed_end - job["created_at"])),
+            "last_polled_at": int(last_poll) if last_poll else None,
+            "poll_age_seconds": max(0, int(now - last_poll)) if last_poll else None,
+            "status_stale": bool(last_poll and not terminal and now - last_poll > max(60, self.poll_seconds * 3)),
+            "poll_after_seconds": None if terminal else self.poll_seconds,
+            "queue_position": self.store.queue_position(job),
             "created_at": int(job["created_at"]),
             "updated_at": int(job["updated_at"]),
             "seconds": job["seconds"],
             "size": f"{job['width']}x{job['height']}",
+            "requested": {"seconds": job["seconds"], "size": f"{job['width']}x{job['height']}",
+                          "width": job["width"], "height": job["height"], "fps": None},
+            "project": job.get("project"),
+            "shot": job.get("shot"),
             "account": self.account_labels.get(job["account"], "unconfigured-account"),
+            "account_id": job["account"],
             "provider_task_id": job.get("provider_task_id"),
             "estimate": estimate,
             "error": job.get("error"),
             "internal_status": internal_status,
             "provider_status": job.get("provider_status"),
         }
+        result["estimate_unit"] = "魔粒"
+        result["estimate_kind"] = "estimated_cost_not_duration_or_final_charge"
+        result["actual"] = None
+        result["spec_warnings"] = []
+        if job.get("actual_metadata"):
+            actual = json.loads(job["actual_metadata"])
+            result["actual"] = {key: actual.get(key) for key in
+                                 ("duration", "width", "height", "fps", "frame_count")}
+            if actual.get("duration") and abs(actual["duration"] - job["seconds"]) > 0.1:
+                result["spec_warnings"].append(
+                    f"Requested {job['seconds']}s; actual {actual['duration']:.3f}s. Adjust timing in the editor.")
+            if actual.get("width") and actual.get("height") and (actual["width"], actual["height"]) != (job["width"], job["height"]):
+                result["spec_warnings"].append(
+                    f"Requested {job['width']}x{job['height']}; actual {actual['width']}x{actual['height']}. Review cropping or padding.")
+        result["prompt"] = job["prompt"]
+        result["style"] = job.get("style")
+        result["negative_prompt"] = job.get("negative_prompt")
+        metadata = json.loads(job.get("input_metadata") or "{}")
+        result["input_frames"] = [
+            {"role": field, **metadata.get(field, {}),
+             "preview_url": f"{base_path}/{job['id']}/frames/{field}"}
+            for field in ("first_frame", "last_frame") if job.get(field)]
         if job.get("result_path"):
             result["output_path"] = job["result_path"]
             result["content_url"] = f"{base_path}/{job['id']}/content"
         return result
+
+    def job_details(self, job):
+        """Backfill old completed outputs when explicitly inspected, without regenerating."""
+        if job["status"] == "completed" and job.get("result_path") and not job.get("actual_metadata"):
+            from .media import InvalidVideoError, validate_video_file
+            try:
+                actual = validate_video_file(self.store.resolve_data_path(job["result_path"]))
+                # Preserve the original completion/update time when migrating metadata.
+                with self.store._connect() as db:
+                    db.execute("UPDATE jobs SET actual_metadata=? WHERE id=?",
+                               (json.dumps(actual), job["id"]))
+                job = self.store.get(job["id"])
+            except (InvalidVideoError, ServiceError):
+                pass
+        return self.public_job(job)
 
     def resolve_unknown_submission(self, job_id, body):
         job = self.store.get(job_id)
@@ -628,8 +812,12 @@ class WanService:
 
                 with sync_playwright() as playwright:
                     ms = ms_provider.connect(playwright, self.account_urls[account])
+                    refreshed_at = 0
                     while not self.stop_event.is_set():
                         self.store.verify_identity(account, ms.identity())
+                        if time.monotonic() - refreshed_at >= 60:
+                            self._refresh_account(ms, account)
+                            refreshed_at = time.monotonic()
                         job = self.store.next_for_account(account)
                         if job:
                             if job["status"] == "queued":
@@ -641,8 +829,16 @@ class WanService:
                                     self._poll_job(ms, job)
                             else:
                                 self._poll_job(ms, job)
+                            current = self.store.get(job["id"])
+                            if job["status"] == "queued" or current["status"] in ("completed", "failed"):
+                                refreshed_at = 0  # Refresh after submission or completion.
                         self.stop_event.wait(self.poll_seconds)
             except (Exception, SystemExit) as exc:
+                with self._profile_lock:
+                    self.account_profiles[account] = {
+                        "id": account, "label": account, "balance": None, "unit": "魔粒",
+                        "status": "blocked" if isinstance(exc, ServiceError) else "unavailable",
+                        "checked_at": time.time(), "balance_error": "请检查浏览器登录、本机服务和账号绑定"}
                 if isinstance(exc, ServiceError) and exc.code in (
                         "account_identity_mismatch", "account_binding_required", "duplicate_account_identity"):
                     job = self.store.next_for_account(account)
@@ -661,7 +857,7 @@ class WanService:
                 self.store.verify_identity(account, ms.identity(), bind_legacy=True)
 
     def _submit_job(self, ms, job):
-        self.store.update(job["id"], status="uploading", error=None)
+        self.store.update(job["id"], status="uploading", started_at=time.time(), error=None)
         try:
             start_frame = self.store.resolve_data_path(job["first_frame"])
             end_frame = self.store.resolve_data_path(job["last_frame"]) if job["last_frame"] else None
@@ -695,6 +891,7 @@ class WanService:
             self.store.update(job["id"], error="Status check failed; will retry.")
             raise RuntimeError("status check failed") from exc
         status = str(provider_result.get("status") or "").upper()
+        self.store.update(job["id"], last_polled_at=time.time())
         if status not in TERMINAL_PROVIDER_STATES:
             self.store.update(job["id"], status="in_progress", provider_status=status or None, error=None)
             return
@@ -717,7 +914,8 @@ class WanService:
 
             response = requests.get(job["provider_url"], timeout=300)
             response.raise_for_status()
-            save_video_bytes(response.content, output)
+            actual = {}
+            save_video_bytes(response.content, output, metadata=actual)
         except Exception as exc:
             attempts = job.get("download_attempts", 0) + 1
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
@@ -729,11 +927,15 @@ class WanService:
                                     "Video download or validation failed; will retry without generating again.")
             return
         self.store.update(job["id"], status="completed", result_path=self.store.relative_data_path(output),
-                          provider_url=None, download_attempts=0, error=None)
+                          actual_metadata=json.dumps(actual, ensure_ascii=False),
+                          completed_at=time.time(), provider_url=None, download_attempts=0, error=None)
 
 
 def _error_payload(message, code="invalid_request_error", param=None):
-    return {"error": {"message": str(message), "type": code, "param": param, "code": code}}
+    error = {"message": str(message), "type": code, "param": param, "code": code}
+    if getattr(message, "details", None):
+        error.update(message.details)
+    return {"error": error}
 
 
 def make_handler(service, token=None):
@@ -756,6 +958,7 @@ def make_handler(service, token=None):
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(encoded)
 
@@ -766,6 +969,12 @@ def make_handler(service, token=None):
             return True
 
         def do_GET(self):
+            try:
+                self._get()
+            except ServiceError as exc:
+                self._json(exc.status, _error_payload(exc, exc.code))
+
+        def _get(self):
             path = urlsplit(self.path).path
             if path == "/health":
                 return self._json(200, {"status": "ok", "workers": len(service.workers)})
@@ -776,12 +985,51 @@ def make_handler(service, token=None):
                     {"id": alias, "object": "model", "created": 0, "owned_by": "modelscope", "kind": "video"}
                     for alias in MODEL_IDS
                 ]})
+            if path == "/v1/media/roots":
+                return self._json(200, {"roots": [str(root) for root in service.media_roots]})
+            if path == "/v1/accounts":
+                return self._json(200, {"accounts": service.account_snapshot()})
             parts = [unquote(part) for part in path.strip("/").split("/")]
+            if len(parts) == 3 and parts[:2] == ["v1", "accounts"]:
+                return self._json(200, service.account_snapshot(parts[2]))
+            if parts == ["v1", "videos"]:
+                query = parse_qs(urlsplit(self.path).query)
+                project = (query.get("project") or [None])[0]
+                try:
+                    limit = max(1, min(200, int((query.get("limit") or [100])[0])))
+                    offset = max(0, int((query.get("offset") or [0])[0]))
+                except ValueError:
+                    raise ServiceError("limit and offset must be whole numbers")
+                jobs = service.store.list_jobs(project=project, limit=limit + 1, offset=offset)
+                return self._json(200, {"object": "list",
+                    "data": [service.public_job(job) for job in jobs[:limit]],
+                    "next_offset": offset + limit if len(jobs) > limit else None})
+            if len(parts) == 5 and parts[:2] == ["v1", "videos"] and parts[3] == "frames":
+                job = service.store.get(parts[2])
+                role = parts[4]
+                if not job or role not in ("first_frame", "last_frame") or not job.get(role):
+                    raise ServiceError("Input frame not found.", 404, "not_found_error")
+                frame = service.store.resolve_data_path(job[role])
+                if not frame.is_file():
+                    raise ServiceError("Input frame is unavailable.", 404, "not_found_error")
+                # Re-encode as PNG: never serve source SVG/HTML or embedded active content.
+                import io
+                with Image.open(frame) as image:
+                    buffer = io.BytesIO()
+                    image.convert("RGB").save(buffer, format="PNG")
+                content = buffer.getvalue()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(content)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(content)
+                return
             if len(parts) == 3 and parts[:2] == ["v1", "videos"]:
                 job = service.store.get(parts[2])
                 if job is None:
                     return self._json(404, _error_payload("Video job not found.", "not_found_error"))
-                return self._json(200, service.public_job(job))
+                return self._json(200, service.job_details(job))
             if len(parts) == 4 and parts[:2] == ["v1", "videos"] and parts[3] == "content":
                 job = service.store.get(parts[2])
                 if job is None:
@@ -806,8 +1054,9 @@ def make_handler(service, token=None):
             path = urlsplit(self.path).path
             parts = [unquote(part) for part in path.strip("/").split("/")]
             is_submit = path == "/v1/videos"
+            is_validate = path == "/v1/frames/validate"
             is_resolve = len(parts) == 4 and parts[:2] == ["v1", "videos"] and parts[3] == "resolve"
-            if not is_submit and not is_resolve:
+            if not is_submit and not is_resolve and not is_validate:
                 return self._json(404, _error_payload("Route not found.", "not_found_error"))
             if not self._check_auth():
                 return
@@ -822,6 +1071,8 @@ def make_handler(service, token=None):
                     job, created = service.submit(body, self.headers.get("Idempotency-Key"))
                     result = service.public_job(job)
                     self._json(202 if created else 200, result)
+                elif is_validate:
+                    self._json(200, service.validate_frames(body))
                 else:
                     job = service.resolve_unknown_submission(parts[2], body)
                     self._json(200, service.public_job(job))

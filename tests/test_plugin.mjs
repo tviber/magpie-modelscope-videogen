@@ -1,27 +1,29 @@
 import assert from "node:assert/strict"
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import test from "node:test"
 
-const { MagpieWanTools } = await import(process.env.WAN_TEST_PLUGIN || "../index.mjs")
+const { MagpieWanTools, default: defaultPlugin } = await import(process.env.WAN_TEST_PLUGIN || "../index.mjs")
 
 async function fixture(t, handler, options = {}) {
   const outputDir = await mkdtemp(join(tmpdir(), "wan-test-"))
-  const server = createServer(handler)
+  const server = createServer((req, res) => {
+    if (req.url === "/v1/accounts" && !options.testAccounts) return res.end('{"accounts":[]}')
+    return handler(req, res)
+  })
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve))
   t.after(async () => {
     server.closeAllConnections()
     await new Promise(resolve => server.close(resolve))
     await rm(outputDir, { recursive: true, force: true })
   })
-  const plugin = await MagpieWanTools({}, {
-    serverUrl: `http://127.0.0.1:${server.address().port}`, outputDir, ...options,
-  })
-  assert.equal(Object.keys(plugin.tool).length, 4)
-  return { tool: plugin.tool.wan_get_video_result, outputDir }
+  const opts = { serverUrl: `http://127.0.0.1:${server.address().port}`, outputDir, ...options }
+  const plugin = await MagpieWanTools({}, opts)
+  assert.equal(Object.keys(plugin.tool).length, 7)
+  return { tool: plugin.tool.wan_get_video_result, outputDir, tools: plugin.tool, plugin, options: opts }
 }
 
 test("result download authenticates and returns a readable local artifact without a token URL", async t => {
@@ -51,6 +53,107 @@ test("unfinished result returns status without creating an artifact", async t =>
   const { tool, outputDir } = await fixture(t, (_req, res) => res.end('{"status":"in_progress"}'))
   assert.equal((await tool.execute({ job_id: "job" }, {})).status, "in_progress")
   assert.deepEqual(await readdir(outputDir), [])
+})
+
+test("submit checks the allowed roots before posting and can copy an outside frame", async t => {
+  const sourceDir = await mkdtemp(join(tmpdir(), "wan-outside-"))
+  const source = join(sourceDir, "frame.png")
+  await writeFile(source, Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aC1sAAAAASUVORK5CYII=", "base64"))
+  t.after(() => rm(sourceDir, { recursive: true, force: true }))
+  const allowed = await mkdtemp(join(tmpdir(), "wan-media-"))
+  t.after(() => rm(allowed, { recursive: true, force: true }))
+  let submitted
+  const { tools } = await fixture(t, async (req, res) => {
+    if (req.url === "/v1/media/roots") return res.end(JSON.stringify({ roots: [allowed] }))
+    if (req.url === "/v1/frames/validate") return res.end('{"valid":true,"frames":{"first_frame":{"width":320,"height":180}}}')
+    if (req.method === "POST") {
+      submitted = JSON.parse(await new Promise(resolve => { let body = ""; req.on("data", part => body += part); req.on("end", () => resolve(body)) }))
+      return res.end(JSON.stringify({ id: "job", status: "queued" }))
+    }
+    res.statusCode = 404
+    res.end()
+  })
+  const args = { prompt: "A camera move", first_frame: source }
+  await assert.rejects(tools.wan_generate_i2v.execute(args, { abort: new AbortController().signal }), /Allowed directories/)
+  assert.equal(submitted, undefined)
+  await tools.wan_generate_i2v.execute({ ...args, copy_to_media_root: true }, { abort: new AbortController().signal })
+  assert.ok(submitted.first_frame.includes("wan-media-"))
+  assert.ok(submitted.first_frame !== source)
+})
+
+test("one plugin export and independent account labels and magicube wallets", async t => {
+  assert.equal(defaultPlugin, MagpieWanTools)
+  const profiles = [
+    { id: "a", label: "Alice", status: "connected", balance: 45, stale: false },
+    { id: "b", label: "Bob", status: "connected", balance: 0, stale: false },
+  ]
+  const { plugin } = await fixture(t, (req, res) => {
+    if (req.url === "/v1/accounts") return res.end(JSON.stringify({ accounts: profiles }))
+    res.end(JSON.stringify(profiles.find(p => req.url.endsWith(`/${p.id}`))))
+  }, { testAccounts: true })
+  const config = {}
+  await plugin.config(config)
+  assert.deepEqual(config.provider["modelscope-wan"].models, {})
+  assert.equal(plugin.auth.methods.length, 3)
+  for (let i = 0; i < profiles.length; i++) {
+    const login = await plugin.auth.methods[i].authorize()
+    assert.equal(login.key, profiles[i].id)
+    assert.equal(login.metadata.email, `${profiles[i].label} · ${profiles[i].id}`)
+    const usage = await plugin.auth.usage(async () => ({ type: "api", key: login.key }))
+    assert.equal(usage.windows[0].balance, profiles[i].balance)
+    assert.equal(usage.windows[0].unit, "魔粒")
+    assert.equal(usage.windows[0].used, undefined)
+  }
+  profiles[0].stale = true
+  assert.equal((await plugin.auth.methods[0].authorize()).type, "failed")
+  assert.deepEqual((await plugin.auth.usage(async () => ({ key: "a" }))).windows, [])
+  profiles[1].balance = null
+  const unknown = await plugin.auth.usage(async () => ({ key: "b" }))
+  assert.deepEqual(unknown.windows, [])
+  assert.ok(unknown.error)
+})
+
+test("result packages escaped preview, frame provenance, specifications and manifest", async t => {
+  const seen = []
+  const { tool } = await fixture(t, (req, res) => {
+    seen.push(req.url)
+    if (req.url.endsWith("/content") || req.url.includes("/frames/")) return res.end("media fixture")
+    res.end(JSON.stringify({ id: "shot-1", status: "completed", project: "MV", shot: "Opening",
+      prompt: '<script>alert("unsafe")</script>', requested: { seconds: 8, size: "1280x720" },
+      actual: { duration: 5.06, width: 1280, height: 736, fps: 16 }, spec_warnings: ["Duration mismatch"],
+      estimate: 45, estimate_unit: "魔粒",
+      input_frames: [{ role: "first_frame", name: "opening.png", width: 1280, height: 720, preview_url: "https://evil.invalid/frame" }],
+    }))
+  })
+  const result = await tool.execute({ job_id: "shot-1" })
+  assert.equal(result.actual.duration, 5.06)
+  assert.equal(result.estimate_unit, "魔粒")
+  assert.equal(result.input_frames[0].name, "opening.png")
+  assert.ok(seen.includes("/v1/videos/shot-1/frames/first_frame"))
+  assert.deepEqual(JSON.parse(await readFile(result.manifest_path, "utf8")), JSON.parse(JSON.stringify(result)))
+  const html = await readFile(result.preview_path, "utf8")
+  assert.ok(html.includes("&lt;script&gt;"))
+  assert.ok(!html.includes("<script>"))
+  assert.ok(html.includes('src="video.mp4"'))
+  assert.ok(!JSON.stringify(result).includes("evil.invalid"))
+})
+
+test("symlinks do not bypass input roots and validation failures clean staged copies", async t => {
+  if (process.platform === "win32") return t.skip("Creating symlinks requires Windows developer mode")
+  const allowed = await mkdtemp(join(tmpdir(), "wan-roots-"))
+  const outside = await mkdtemp(join(tmpdir(), "wan-outside-"))
+  t.after(async () => { await rm(allowed, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }) })
+  const source = join(outside, "frame.png")
+  await writeFile(source, "invalid image")
+  const linked = join(allowed, "linked.png")
+  await symlink(source, linked)
+  const { tools } = await fixture(t, (req, res) => {
+    if (req.url === "/v1/media/roots") return res.end(JSON.stringify({ roots: [allowed] }))
+    res.writeHead(400).end('{"error":{"message":"frame file is not a readable image"}}')
+  })
+  await assert.rejects(tools.wan_prepare_frames.execute({ first_frame: linked }), /outside WAN_MEDIA_ROOTS/)
+  await assert.rejects(tools.wan_prepare_frames.execute({ first_frame: linked, copy_to_media_root: true }), /readable image/)
+  assert.deepEqual(await readdir(allowed), ["linked.png"])
 })
 
 test("authentication failure leaves no artifact", async t => {
@@ -88,4 +191,35 @@ test("abort removes a partially downloaded video", async t => {
   })
   await assert.rejects(tool.execute({ job_id: "job" }, { abort: controller.signal }))
   assert.deepEqual(await readdir(outputDir), [])
+})
+
+test("completion watcher resumes persisted tasks, downloads once and emits useful notification", async t => {
+  t.mock.timers.enable({ apis: ["setTimeout"] })
+  const notifications = []
+  const { createHash } = await import("node:crypto")
+  const { outputDir, options: opts } = await fixture(t, (req, res) => {
+    if (req.url.endsWith("/content")) return res.end("video fixture")
+    res.end(JSON.stringify({ id: "watched", status: "completed", project: "MV", shot: "Opening", prompt: "A steady camera",
+      actual: { duration: 5.06, width: 1280, height: 736, fps: 16 }, input_frames: [] }))
+  })
+  const state = join(outputDir, `watch-${createHash("sha256").update(opts.serverUrl).digest("hex").slice(0, 24)}.json`)
+  await writeFile(state, JSON.stringify(["watched"]))
+  let notified
+  const received = new Promise(resolve => { notified = resolve })
+  await MagpieWanTools({ client: { tui: { showToast: async payload => { notifications.push(payload.body); notified() } } } }, opts)
+  // Drain the initial filesystem read before advancing the watch timer.
+  for (let i = 0; i < 30 && notifications.length === 0; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+    t.mock.timers.tick(15_000)
+  }
+  await received
+  for (let i = 0; i < 30; i++) {
+    await new Promise(resolve => setImmediate(resolve))
+    if ((await readFile(state, "utf8")) === "[]") break
+  }
+  assert.equal(notifications.length, 1)
+  assert.match(notifications[0].message, /5.06 秒 · 1280×736 · 16 fps/)
+  assert.match(notifications[0].message, /A steady camera/)
+  assert.match(notifications[0].message, /preview.html/)
+  assert.deepEqual(JSON.parse(await readFile(state, "utf8")), [])
 })
