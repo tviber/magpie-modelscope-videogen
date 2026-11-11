@@ -26,9 +26,13 @@ jobs:
           import json
           info = json.load(open('pack.json'))[0]
           expected = {'index.mjs', 'package.json', 'README.md', 'PRIVACY.md', 'pyproject.toml',
+                      'assets/modelscope-icon.png', 'assets/README.md',
                       'src/magpie_wan/__init__.py', 'src/magpie_wan/provider.py',
                       'src/magpie_wan/service.py', 'src/magpie_wan/media.py'}
-          assert {f['path'] for f in info['files']} == expected
+          actual = {f['path'] for f in info['files']}
+          assert actual == expected, (
+              f'Missing package files: {sorted(expected - actual)}; '
+              f'Unexpected package files: {sorted(actual - expected)}')
           PY
       - name: Install only the tarball into an isolated project
         run: |
