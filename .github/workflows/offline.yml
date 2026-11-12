@@ -28,7 +28,8 @@ jobs:
           expected = {'index.mjs', 'package.json', 'README.md', 'PRIVACY.md', 'pyproject.toml',
                       'assets/modelscope-icon.png', 'assets/README.md',
                       'src/magpie_wan/__init__.py', 'src/magpie_wan/provider.py',
-                      'src/magpie_wan/service.py', 'src/magpie_wan/media.py'}
+                      'src/magpie_wan/service.py', 'src/magpie_wan/media.py',
+                      'src/magpie_wan/login.py'}
           actual = {f['path'] for f in info['files']}
           assert actual == expected, (
               f'Missing package files: {sorted(expected - actual)}; '
