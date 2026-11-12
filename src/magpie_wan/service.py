@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 from PIL import Image
 
 from . import provider as ms_provider
+from . import __version__
 
 
 DEFAULT_MODEL = "wan2.1-flf2v-14b"
@@ -50,7 +51,8 @@ MAX_STYLE_CHARS = 4_000
 MAX_DURATION_SECONDS = 10
 MAX_PROJECT_CHARS = 160
 TERMINAL_PROVIDER_STATES = {"SUCCEED", "FAILED", "CANCELED"}
-ACTIVE_STATES = ("queued", "uploading", "submitting", "in_progress", "download_pending", "unknown_submission")
+ACTIVE_STATES = ("queued", "uploading", "submitting", "in_progress", "download_pending", "unknown_submission", "paused")
+PROTOCOL_VERSION = 2
 PUBLIC_STATUS = {
     "queued": "queued",
     "uploading": "in_progress",
@@ -60,7 +62,33 @@ PUBLIC_STATUS = {
     "unknown_submission": "in_progress",
     "completed": "completed",
     "failed": "failed",
+    "paused": "paused",
+    "cancelled": "cancelled",
 }
+
+
+def safe_provider_failure(stage, exc=None, payload=None):
+    """Keep only documented error fields, never entire responses or exception text."""
+    payload = payload if isinstance(payload, dict) else {}
+    reason = next((payload[k] for k in ("errorMessage", "failReason", "failureReason", "message")
+                   if isinstance(payload.get(k), str) and payload[k].strip()), None)
+    if isinstance(exc, ms_provider.SubmissionRejected):
+        reason = str(exc)
+    if reason:
+        reason = re.sub(r"https?://[^\s]+", "[URL removed]", reason)
+        reason = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]+", "[email removed]", reason)
+        reason = re.sub(r"(?:[A-Za-z]:\\|/(?:Users|home|tmp|private)/)[^\s,;]+", "[path removed]", reason)
+        reason = re.sub(r"(?i)\b(token|cookie|authorization|password|secret|session)\b\s*[:=]\s*[^\s,;]+",
+                        r"\1=[redacted]", reason)
+        reason = re.sub(r"\b(?:Bearer\s+)?[A-Za-z0-9_+=/-]{32,}\b", "[redacted]", reason)
+        reason = reason[:400]
+    code = payload.get("errorCode") or payload.get("code") or getattr(exc, "code", None)
+    code = str(code) if isinstance(code, (str, int)) and re.fullmatch(r"[\w.-]{1,64}", str(code)) else None
+    return {"stage": stage, "provider_code": code, "provider_reason": reason,
+            "reason_available": bool(reason),
+            "message": reason or "服务端未提供原因。",
+            "http_status": getattr(exc, "status", None) if isinstance(exc, ms_provider.ModelScopeAPIError) else None,
+            "exception_type": type(exc).__name__ if exc else None}
 
 
 class ServiceError(ValueError):
@@ -90,8 +118,10 @@ def parse_accounts(raw=None):
             accounts = json.loads(named)
         except json.JSONDecodeError as exc:
             raise ServiceError("WAN_MODELSCOPE_ACCOUNTS must be a JSON object of stable IDs to CDP URLs") from exc
-        return validate_accounts(accounts)
-    raw = raw if raw is not None else os.environ.get("WAN_MODELSCOPE_CDP_URLS", "http://127.0.0.1:9223")
+        return {} if accounts == {} else validate_accounts(accounts)
+    if raw is None and "WAN_MODELSCOPE_CDP_URLS" not in os.environ:
+        return {}
+    raw = raw if raw is not None else os.environ["WAN_MODELSCOPE_CDP_URLS"]
     urls = [item.strip() for item in raw.split(",") if item.strip()]
     if not urls:
         raise ServiceError("WAN_MODELSCOPE_CDP_URLS must contain at least one CDP URL")
@@ -134,8 +164,11 @@ def _browser_executable():
     return next((path for path in candidates if path.is_file()), None)
 
 
-def _free_cdp_port(start=9223):
+def _free_cdp_port(start=9223, excluded=()):
+    excluded = {int(port) for port in excluded}
     for port in range(start, min(start + 1000, 65536)):
+        if port in excluded:
+            continue
         with socket.socket() as probe:
             try:
                 probe.bind(("127.0.0.1", port))
@@ -224,7 +257,7 @@ def _validate_frame(value, roots):
 
 
 def _fingerprint(first_frame, last_frame, prompt, model, seconds, width, height, style, negative_prompt, seed,
-                 project=None, shot=None, account=None):
+                 project=None, shot=None, account=None, routing=None, preferred_account=None):
     digest = hashlib.sha256()
     for image_path in (first_frame, last_frame):
         content = b"" if image_path is None else Path(image_path).read_bytes()
@@ -241,7 +274,8 @@ def _fingerprint(first_frame, last_frame, prompt, model, seconds, width, height,
         "seed": seed,
     }
     # Keep legacy hashes unchanged for requests without grouping or account selection.
-    for key, value in (("project", project), ("shot", shot), ("account", account)):
+    for key, value in (("project", project), ("shot", shot), ("account", account),
+                       ("routing", routing), ("preferred_account", preferred_account)):
         if value is not None:
             fields[key] = value
     digest.update(json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
@@ -329,10 +363,16 @@ class JobStore:
                 db.execute("ALTER TABLE jobs ADD COLUMN project TEXT")
             for name, kind in (("shot", "TEXT"), ("input_metadata", "TEXT"),
                                ("last_polled_at", "REAL"), ("started_at", "REAL"),
-                               ("completed_at", "REAL")):
+                               ("completed_at", "REAL"), ("submitted_at", "REAL"),
+                               ("failure_details", "TEXT")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project, created_at)")
+            db.execute("""CREATE TABLE IF NOT EXISTS job_events (
+                seq INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL,
+                at REAL NOT NULL, kind TEXT NOT NULL, details TEXT NOT NULL
+            )""")
+            db.execute("CREATE INDEX IF NOT EXISTS events_job ON job_events(job_id, seq)")
             db.execute("""CREATE TABLE IF NOT EXISTS accounts (
                 id TEXT PRIMARY KEY, fingerprint TEXT UNIQUE, requires_binding INTEGER NOT NULL
             )""")
@@ -383,10 +423,14 @@ class JobStore:
     def recover(self):
         now = time.time()
         with self._connect() as db:
+            interrupted = db.execute("SELECT id,status FROM jobs WHERE status='uploading' OR (status='submitting' AND provider_task_id IS NULL)").fetchall()
             db.execute("UPDATE jobs SET status='queued', updated_at=?, error=NULL WHERE status='uploading'", (now,))
             db.execute("""UPDATE jobs SET status='unknown_submission', updated_at=?,
                 error='The service stopped during submission; check ModelScope before retrying.'
                 WHERE status='submitting' AND provider_task_id IS NULL""", (now,))
+            for job in interrupted:
+                self._event(db, job["id"], "service_recovery", {"previous_status": job["status"],
+                            "action": "requeue_unsubmitted" if job["status"] == "uploading" else "reconcile_required"})
 
     def get_by_idempotency(self, key):
         if not key:
@@ -420,6 +464,18 @@ class JobStore:
         placeholders = ",".join("?" for _ in columns)
         with self._connect() as db:
             db.execute(f"INSERT INTO jobs ({','.join(columns)}) VALUES ({placeholders})", tuple(row.values()))
+            self._event(db, row["id"], "queued", {"account": row["account"]})
+
+    @staticmethod
+    def _event(db, job_id, kind, details):
+        db.execute("INSERT INTO job_events(job_id,at,kind,details) VALUES(?,?,?,?)",
+                   (job_id, time.time(), kind, json.dumps(details, ensure_ascii=False)))
+
+    def events(self, job_id):
+        with self._connect() as db:
+            rows = db.execute("SELECT at,kind,details FROM job_events WHERE job_id=? ORDER BY seq DESC LIMIT 100",
+                              (job_id,)).fetchall()
+        return [{"at": r["at"], "kind": r["kind"], **json.loads(r["details"])} for r in reversed(rows)]
 
     def get(self, job_id):
         with self._connect() as db:
@@ -451,7 +507,25 @@ class JobStore:
         fields["updated_at"] = time.time()
         clause = ", ".join(f"{name}=?" for name in fields)
         with self._connect() as db:
+            previous = db.execute("SELECT status,account FROM jobs WHERE id=?", (job_id,)).fetchone()
             db.execute(f"UPDATE jobs SET {clause} WHERE id=?", (*fields.values(), job_id))
+            if previous and (fields.get("status", previous["status"]) != previous["status"] or
+                             fields.get("account", previous["account"]) != previous["account"]):
+                self._event(db, job_id, fields.get("status", previous["status"]),
+                            {"account": fields.get("account", previous["account"]),
+                             "previous_account": previous["account"],
+                             "provider_task_id": fields.get("provider_task_id")})
+
+    def record_event(self, job_id, kind, **details):
+        with self._connect() as db:
+            self._event(db, job_id, kind, details)
+
+    def account_jobs(self, account):
+        with self._connect() as db:
+            placeholders = ','.join('?' for _ in ACTIVE_STATES)
+            rows = db.execute(f"SELECT * FROM jobs WHERE account=? AND status IN ({placeholders}) ORDER BY created_at,id",
+                              (account, *ACTIVE_STATES)).fetchall()
+        return [dict(row) for row in rows]
 
     def next_for_account(self, account):
         with self._connect() as db:
@@ -474,13 +548,13 @@ class WanService:
     def __init__(self, *, data_dir=None, accounts=None, media_roots=None,
                  poll_seconds=15):
         account_urls = accounts if accounts is not None else parse_accounts()
-        if not account_urls:
-            raise ServiceError("Configure at least one ModelScope CDP URL")
-        self._startup_accounts = set(account_urls) if isinstance(account_urls, dict) else {
+        configured_accounts = set(account_urls) if isinstance(account_urls, dict) else {
             ms_provider.account_label(index) for index in range(len(account_urls))
         }
-        self.account_urls = validate_accounts(dict(account_urls) if isinstance(account_urls, dict) else {
-            ms_provider.account_label(index): url for index, url in enumerate(account_urls)})
+        self.account_urls = dict(account_urls) if isinstance(account_urls, dict) else {
+            ms_provider.account_label(index): url for index, url in enumerate(account_urls)}
+        if self.account_urls:
+            validate_accounts(self.account_urls)
         configured_roots = (tuple(Path(p).expanduser().resolve() for p in media_roots)
                             if media_roots is not None else tuple(parse_media_roots()))
         if not configured_roots:
@@ -491,15 +565,37 @@ class WanService:
             saved_accounts = json.loads(registry_path.read_text(encoding="utf-8"))
             if not isinstance(saved_accounts, dict):
                 raise ServiceError("Saved browser account registry is invalid")
+            configured_ports = {urlsplit(url).port for url in self.account_urls.values()
+                                if urlsplit(url).port is not None}
             for account, url in (validate_accounts(saved_accounts) if saved_accounts else {}).items():
+                if account in self.account_urls and (self.store.data_dir / "browser-profiles" / account).is_dir():
+                    # The registry contains the last dynamically allocated port.
+                    # A configured managed account will receive a new port at start.
+                    continue
                 if account in self.account_urls and self.account_urls[account] != url:
                     raise ServiceError(f"Saved browser account conflicts with configured account {account}")
+                # Managed browser ports are ephemeral. If an old registry points
+                # at a port now reserved by a manually configured account, assign
+                # a fresh local port before validating the merged account map.
+                if account not in self.account_urls and urlsplit(url).port in configured_ports:
+                    url = f"http://127.0.0.1:{_free_cdp_port(excluded=configured_ports)}"
                 self.account_urls.setdefault(account, url)
+                if account not in configured_accounts:
+                    configured_ports.add(urlsplit(url).port)
         except FileNotFoundError:
             pass
         except (json.JSONDecodeError, TypeError) as exc:
             raise ServiceError("Saved browser account registry is invalid") from exc
-        self.account_urls = validate_accounts(self.account_urls)
+        if self.account_urls:
+            validate_accounts(self.account_urls)
+        # A local account profile marks a configured endpoint as service-managed.
+        # This lets launchd restart its Chrome and keeps manual CDP endpoints
+        # externally managed when no private profile exists.
+        managed_accounts = {
+            account for account in configured_accounts
+            if (self.store.data_dir / "browser-profiles" / account).is_dir()
+        }
+        self._startup_accounts = configured_accounts - managed_accounts
         lock_path = self.store.data_dir / ".service.lock"
         self._service_lock = lock_path.open("a+b")
         os.chmod(lock_path, 0o600)
@@ -520,9 +616,11 @@ class WanService:
         self.account_labels = {account: account for account in self.accounts}
         self._profile_lock = threading.Lock()
         self._accounts_lock = threading.RLock()
+        self._submit_lock = threading.Lock()
         self._browser_processes = {}
         self._browser_modes = {}
         self._pending_accounts = set()
+        self._account_unavailable_since = {}
         self._account_operations = {account: threading.Lock() for account in self.accounts}
         self.account_profiles = {account: {"id": account, "label": account, "balance": None,
                                           "status": "connecting", "checked_at": None,
@@ -590,6 +688,7 @@ class WanService:
                 else "魔粒余额暂不可用；稍后自动重试"
         self.store.verify_identity(account, ms.identity())
         with self._profile_lock:
+            self._account_unavailable_since.pop(account, None)
             self.account_profiles[account] = {
                 "id": account, "label": label, "balance": balance, "unit": "魔粒",
                 "status": "connected", "checked_at": time.time(), "balance_error": balance_error,
@@ -606,6 +705,11 @@ class WanService:
         return {"valid": True, "frames": frames}
 
     def submit(self, body, idempotency_header=None):
+        # Selection and durable insertion are one scheduling operation.
+        with self._submit_lock:
+            return self._submit(body, idempotency_header)
+
+    def _submit(self, body, idempotency_header=None):
         if not isinstance(body, dict):
             raise ServiceError("request body must be a JSON object")
         prompt = body.get("prompt")
@@ -627,6 +731,14 @@ class WanService:
         if requested_account is not None and (not isinstance(requested_account, str) or
                                                requested_account not in self.accounts):
             raise ServiceError("account must be one of the configured account IDs")
+
+        routing = body.get("routing")
+        if routing not in (None, "preferred", "balanced"):
+            raise ServiceError("routing must be preferred or balanced")
+        preferred_account = body.get("preferred_account")
+        if preferred_account is not None and (not isinstance(preferred_account, str) or
+                                               preferred_account not in self.accounts):
+            raise ServiceError("preferred_account must be one of the configured account IDs")
 
         first_value = body.get("first_frame", body.get("image"))
         if first_value is None:
@@ -680,7 +792,7 @@ class WanService:
             idempotency_key = idempotency_key.strip()
 
         fingerprint = _fingerprint(first_path, last_path, prompt, model, seconds, width, height,
-                                   style, negative_prompt, seed, project, shot, requested_account)
+                                   style, negative_prompt, seed, project, shot, requested_account, routing, preferred_account)
         previous = self.store.get_by_idempotency(idempotency_key)
         if previous:
             if previous["input_fingerprint"] != fingerprint:
@@ -701,7 +813,7 @@ class WanService:
             shutil.copyfile(last_path, last_copy)
             last_copy.chmod(0o600)
         stored_fingerprint = _fingerprint(first_copy, last_copy, prompt, model, seconds, width, height,
-                                          style, negative_prompt, seed, project, shot, requested_account)
+                                          style, negative_prompt, seed, project, shot, requested_account, routing, preferred_account)
 
         eligible = [a for a in self.accounts if a not in self._pending_accounts
                     and not self.logins.is_active(a)]
@@ -709,7 +821,32 @@ class WanService:
             shutil.rmtree(job_dir, ignore_errors=True)
             raise ServiceError("账号正在登录，请完成登录后再提交任务。", 409, "account_login_pending")
         counts = self.store.active_counts(eligible)
-        account = requested_account or min(eligible, key=lambda candidate: counts.get(candidate, 0))
+        if requested_account:
+            account = requested_account
+        elif routing is None:
+            # Preserve the legacy HTTP API's queue-only scheduling.
+            account = min(eligible, key=lambda candidate: counts.get(candidate, 0))
+        else:
+            profiles = {p["id"]: p for p in self.account_snapshot()}
+            available = [a for a in eligible if profiles[a]["status"] == "connected"
+                         and not profiles[a]["stale"]
+                         and isinstance(profiles[a]["balance"], (int, float))
+                         and not isinstance(profiles[a]["balance"], bool)
+                         and math.isfinite(profiles[a]["balance"]) and profiles[a]["balance"] > 0]
+            if not available:
+                shutil.rmtree(job_dir, ignore_errors=True)
+                raise ServiceError("没有余额有效且已登录的账号，请刷新余额或重新登录。", 409,
+                                   "no_available_account")
+            if routing == "preferred":
+                account = preferred_account or available[0]
+                if account not in available:
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    raise ServiceError("首选账号当前不可用，请更换首选账号或使用均衡模式。", 409,
+                                       "preferred_account_unavailable")
+            else:
+                # Equivalent to a max-heap top; do not invent deductions before
+                # ModelScope reports the actual available wallet balance.
+                account = min(available, key=lambda a: (-profiles[a]["balance"], counts[a], a))
         input_metadata = {}
         for role, path, w, h in (("first_frame", first_path, source_w, source_h),
                                  ("last_frame", last_path, last_w if last_path else None,
@@ -768,11 +905,13 @@ class WanService:
             "unknown_submission": "Submission needs reconciliation",
             "completed": "Video ready",
             "failed": "Generation failed",
+            "paused": "Local queue paused",
+            "cancelled": "Local waiting task cancelled",
         }[internal_status]
         estimate = json.loads(job["estimate"]) if job.get("estimate") else None
         now = time.time()
         last_poll = job.get("last_polled_at")
-        terminal = internal_status in ("completed", "failed")
+        terminal = internal_status in ("completed", "failed", "cancelled")
         elapsed_end = job.get("completed_at") or (job["updated_at"] if terminal else now)
         result = {
             "id": job["id"],
@@ -809,6 +948,54 @@ class WanService:
             "provider_status": job.get("provider_status"),
         }
         result["estimate_unit"] = "魔粒"
+        profile = next((p for p in self.account_snapshot() if p["id"] == job["account"]), None)
+        connection = "unconfigured" if profile is None else profile["status"]
+        unavailable = profile is None or connection != "connected" or profile["stale"]
+        peers = self.store.account_jobs(job["account"])
+        uncertain = next((p for p in peers if p["status"] in ("submitting", "unknown_submission")), None)
+        next_job = self.store.next_for_account(job["account"])
+        blocker = uncertain or (next_job if next_job and next_job["id"] != job["id"] else None)
+        reason = None
+        if not terminal:
+            if internal_status == "paused":
+                reason = "此任务已暂停，恢复后才会提交。"
+            elif internal_status == "unknown_submission":
+                reason = "提交结果不明，需要核对原账号的服务端任务；不会自动重发。"
+            elif unavailable:
+                reason = "账号连接不可用或状态过期，等待账号恢复。"
+            elif internal_status == "queued" and blocker:
+                reason = f"等待同账号任务 {blocker['id']}（{blocker['status']}）。"
+            elif result["status_stale"]:
+                reason = "任务状态查询已过期，等待下一次成功查询。"
+        waiting = [p["id"] for p in peers if p["status"] == "queued" and p["id"] != job["id"]]
+        result["connection"] = {"status": connection, "stale": profile["stale"] if profile else True,
+                                "error": profile.get("session_error") if profile else "账号未配置",
+                                "unavailable_since": self._account_unavailable_since.get(job["account"])}
+        holds_queue = not terminal and ((next_job and next_job["id"] == job["id"]) or
+                                        internal_status == "unknown_submission")
+        result["blockage"] = {"reason": reason, "blocked_by_job_id": blocker["id"] if blocker and internal_status == "queued" else None,
+                              "waiting_job_ids": waiting if holds_queue else []}
+        result["last_confirmed_provider_status"] = job.get("provider_status")
+        result["execution_phase"] = phase
+        if reason:
+            result["phase"] = reason
+            result["progress_message"] = reason + (f" 服务端最后状态：{job['provider_status']}。" if job.get("provider_status") else "")
+        queued_end = job.get("started_at") or (elapsed_end if terminal else now)
+        submitted = job.get("submitted_at")
+        generation_end = job.get("completed_at") or (job["updated_at"] if terminal else now)
+        result["timing"] = {"queue_seconds": max(0, int(queued_end - job["created_at"])),
+                            "generation_seconds": max(0, int(generation_end - submitted)) if submitted else None,
+                            "since_last_successful_poll_seconds": result["poll_age_seconds"],
+                            "connection_unavailable_seconds": max(0, int(now - result["connection"]["unavailable_since"]))
+                            if result["connection"]["unavailable_since"] else None}
+        result["failure"] = json.loads(job["failure_details"]) if job.get("failure_details") else None
+        result["recovery"] = {"safe_to_resubmit": internal_status == "failed" and not job.get("provider_task_id"),
+                              "action": "reconcile" if internal_status == "unknown_submission" else
+                              "restore_account" if not terminal and unavailable else
+                              "resume" if internal_status == "paused" else
+                              "inspect_provider_task_before_retry" if internal_status == "failed" and job.get("provider_task_id") else None,
+                              "actual_charge": None, "charge_verified": False}
+        result["quality_acceptance"] = "not_evaluated"
         result["estimate_kind"] = "estimated_cost_not_duration_or_final_charge"
         result["actual"] = None
         result["spec_warnings"] = []
@@ -848,7 +1035,64 @@ class WanService:
                 job = self.store.get(job["id"])
             except (InvalidVideoError, ServiceError):
                 pass
-        return self.public_job(job)
+        result = self.public_job(job)
+        result["events"] = self.store.events(job["id"])
+        return result
+
+    def control_job(self, job_id, body):
+        action = body.get("action")
+        if action not in ("pause", "resume", "cancel", "reassign", "resolve"):
+            raise ServiceError("action must be pause, resume, cancel, reassign or resolve")
+        with self._submit_lock:
+            job = self.store.get(job_id)
+            if job is None:
+                raise ServiceError("video job not found", 404, "not_found_error")
+            operation = self._account_operations[job["account"]]
+            if not operation.acquire(blocking=False):
+                raise ServiceError("账号正在操作任务，请稍后重试。", 409, "account_busy")
+            try:
+                job = self.store.get(job_id)
+                if action == "resolve":
+                    return self.resolve_unknown_submission(job_id, body)
+                if job["status"] not in ("queued", "paused") or job.get("provider_task_id"):
+                    raise ServiceError("仅尚未提交的 queued/paused 任务可执行此操作。", 409, "invalid_job_state")
+                if action == "reassign":
+                    target = body.get("account")
+                    if not isinstance(target, str) or target not in self.accounts:
+                        raise ServiceError("account must be a configured account ID")
+                    p = self.account_snapshot(target)
+                    if target in self._pending_accounts or self.logins.is_active(target) or p["status"] != "connected" or p["stale"]:
+                        raise ServiceError("目标账号当前不可用。", 409, "account_unavailable")
+                    self.store.update(job_id, account=target, error=None)
+                else:
+                    self.store.update(job_id, status={"pause": "paused", "resume": "queued", "cancel": "cancelled"}[action],
+                                      completed_at=time.time() if action == "cancel" else None, error=None)
+                return self.store.get(job_id)
+            finally:
+                operation.release()
+
+    def diagnostics(self):
+        accounts = self.account_snapshot()
+        with self.store._connect() as db:
+            rows = db.execute("SELECT id,account,status FROM jobs WHERE status IN ('queued','paused','unknown_submission','in_progress','download_pending','submitting','uploading')").fetchall()
+        unhealthy = {a["id"] for a in accounts if a["status"] != "connected" or a["stale"]}
+        return {"service_version": __version__, "protocol_version": PROTOCOL_VERSION,
+                "workers": [{"account": a, "alive": any(w.name == f"wan-worker-{a}" and w.is_alive() for w in self.workers)} for a in self.accounts],
+                "accounts": accounts, "media_roots": [{"path": str(p), "exists": p.is_dir()} for p in self.media_roots],
+                "affected_jobs": [dict(r) for r in rows if r["account"] in unhealthy or r["status"] == "unknown_submission"]}
+
+    def models(self):
+        with self.store._connect() as db:
+            rows = db.execute("SELECT model,MAX(completed_at) AS last_success FROM jobs WHERE status='completed' GROUP BY model").fetchall()
+        successes = {r["model"]: r["last_success"] for r in rows}
+        return {"object": "list", "data": [
+            {"id": alias, "object": "model", "created": 0, "owned_by": "modelscope", "kind": "video",
+             "first_frame_required": True, "last_frame_supported": alias == DEFAULT_MODEL,
+             "seconds": {"min": 1, "max": MAX_DURATION_SECONDS},
+             "dimensions": {"min": 256, "max": 1280, "multiple_of": 16, "preserve_aspect_ratio": True},
+             "limits_source": "adapter_validation_not_live_provider_guarantee",
+             "provider_verified_at": None, "last_local_download_success_at": successes.get(alias),
+             "quality_acceptance": "not_evaluated"} for alias in MODEL_IDS]}
 
     def resolve_unknown_submission(self, job_id, body):
         job = self.store.get(job_id)
@@ -857,14 +1101,20 @@ class WanService:
         if job["status"] != "unknown_submission":
             raise ServiceError("job is not waiting for submission reconciliation", 409, "invalid_job_state")
         provider_task_id = body.get("provider_task_id")
+        if provider_task_id is not None and (not isinstance(provider_task_id, str) or
+                not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", provider_task_id)):
+            raise ServiceError("provider_task_id must contain only letters, numbers, underscores or hyphens")
+        if bool(provider_task_id) == (body.get("confirm_no_task") is True):
+            raise ServiceError("Choose exactly one: provider_task_id or confirm_no_task=true")
         if isinstance(provider_task_id, str) and provider_task_id.strip():
             self.store.update(job_id, status="in_progress", provider_task_id=provider_task_id.strip(),
-                              provider_status=None, provider_url=None, error=None)
+                              provider_status=None, provider_url=None, error=None, submitted_at=time.time(), failure_details=None)
         elif body.get("confirm_no_task") is True:
             self.store.update(job_id, status="queued", provider_task_id=None, provider_status=None,
-                              provider_url=None, error=None)
+                              provider_url=None, error=None, failure_details=None, submitted_at=None)
         else:
             raise ServiceError("provide provider_task_id, or set confirm_no_task=true after checking ModelScope")
+        self.store.record_event(job_id, "reconciled", resolution="linked_task" if provider_task_id else "confirmed_no_task")
         return self.store.get(job_id)
 
     def start(self):
@@ -909,7 +1159,11 @@ class WanService:
             if not profile.is_dir():
                 raise ServiceError("账号的浏览器目录不存在，请恢复原目录。", 409)
             # A managed endpoint is local and gets a new free port on each restart.
-            port = _free_cdp_port()
+            excluded_ports = {
+                urlsplit(url).port for name, url in self.account_urls.items()
+                if name != account and urlsplit(url).port is not None
+            }
+            port = _free_cdp_port(excluded=excluded_ports)
             command = [str(executable), *(["--headless=new"] if headless else []), "--remote-debugging-address=127.0.0.1",
                        f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
                        "--no-first-run", "--no-default-browser-check", "--window-size=1100,760",
@@ -1040,7 +1294,10 @@ class WanService:
                         self.stop_event.wait(self.poll_seconds)
             except (Exception, SystemExit) as exc:
                 with self._profile_lock:
+                    self._account_unavailable_since.setdefault(account, time.time())
                     detail = str(exc) if isinstance(exc, RuntimeError) and "ModelScope" in str(exc) else None
+                    if isinstance(exc, ServiceError) and exc.code == "account_identity_mismatch":
+                        detail = f"{account} 的浏览器登录身份与原绑定不一致，请重新登录此账号的原 ModelScope 身份。"
                     self.account_profiles[account] = {
                         "id": account, "label": self.account_profiles[account].get("label") or account,
                         "balance": None, "unit": "魔粒",
@@ -1066,46 +1323,62 @@ class WanService:
 
     def _submit_job(self, ms, job):
         self.store.update(job["id"], status="uploading", started_at=time.time(), error=None)
+        stage = "upload"
         try:
             start_frame = self.store.resolve_data_path(job["first_frame"])
             end_frame = self.store.resolve_data_path(job["last_frame"]) if job["last_frame"] else None
             start_url = ms.upload(start_frame, job["width"], job["height"])
             end_url = ms.upload(end_frame, job["width"], job["height"]) if end_frame else None
+            stage = "request"
             request = ms.request(MODEL_IDS[job["model"]], start_url, end_url, job["prompt"], job["seconds"],
                                  width=job["width"], height=job["height"], style=job["style"],
                                  negative_prompt=job["negative_prompt"], seed=job["seed"])
+            stage = "estimate"
+            self.store.record_event(job["id"], "estimating")
             estimate = ms.estimate(request)
             self.store.update(job["id"], estimate=json.dumps(estimate, ensure_ascii=False))
         except Exception as exc:
-            self.store.update(job["id"], status="failed", error="ModelScope preflight failed. Check the local service logs.")
+            self.store.update(job["id"], status="failed", completed_at=time.time(),
+                              failure_details=json.dumps(safe_provider_failure(stage, exc)),
+                              error=f"ModelScope {stage} failed; no generation task was submitted.")
             return
 
         self.store.update(job["id"], status="submitting", error=None)
         try:
             task_id = ms.submit(request)
         except ms_provider.SubmissionRejected as exc:
-            self.store.update(job["id"], status="failed", error="ModelScope rejected the submission. Check the local service logs.")
+            self.store.update(job["id"], status="failed", completed_at=time.time(),
+                              failure_details=json.dumps(safe_provider_failure("submit", exc)),
+                              error="ModelScope rejected the submission.")
             return
         except Exception as exc:
             self.store.update(job["id"], status="unknown_submission",
+                              failure_details=json.dumps(safe_provider_failure("submit", exc)),
                               error="Submission may have reached ModelScope; inspect that account before retrying.")
             return
-        self.store.update(job["id"], status="in_progress", provider_task_id=str(task_id), error=None)
+        self.store.update(job["id"], status="in_progress", provider_task_id=str(task_id),
+                          submitted_at=time.time(), error=None, failure_details=None)
 
     def _poll_job(self, ms, job):
         try:
             provider_result = ms.status(job["provider_task_id"])
         except Exception as exc:
-            self.store.update(job["id"], error="Status check failed; will retry.")
+            failure = safe_provider_failure("poll", exc)
+            if not job.get("failure_details"):
+                self.store.record_event(job["id"], "poll_failed", stage="poll")
+            self.store.update(job["id"], error="Status check failed; will retry.", failure_details=json.dumps(failure))
             raise RuntimeError("status check failed") from exc
         status = str(provider_result.get("status") or "").upper()
-        self.store.update(job["id"], last_polled_at=time.time())
+        self.store.update(job["id"], last_polled_at=time.time(), failure_details=None)
+        if status != job.get("provider_status") or job.get("failure_details"):
+            self.store.record_event(job["id"], "provider_status", provider_status=status[:60])
         if status not in TERMINAL_PROVIDER_STATES:
             self.store.update(job["id"], status="in_progress", provider_status=status or None, error=None)
             return
         if status != "SUCCEED":
             self.store.update(job["id"], status="failed", provider_status=status,
-                              error=f"ModelScope task ended with {status}.")
+                              completed_at=time.time(), failure_details=json.dumps(safe_provider_failure("generation", payload=provider_result)),
+                              error=f"ModelScope task ended with {status}. " + safe_provider_failure("generation", payload=provider_result)["message"])
             return
         video_url = provider_result.get("url") or ms_provider.find_url(provider_result)
         self.store.update(job["id"], status="download_pending", provider_status=status, provider_url=video_url,
@@ -1129,6 +1402,7 @@ class WanService:
             status_code = getattr(getattr(exc, "response", None), "status_code", None)
             refresh = status_code in (401, 403) or attempts >= 3
             self.store.update(job["id"], status="download_pending",
+                              failure_details=json.dumps(safe_provider_failure("download", exc)),
                               provider_url=None if refresh else job["provider_url"],
                               download_attempts=0 if refresh else attempts,
                               error="Video download failed; will refresh the original task URL." if refresh else
@@ -1136,7 +1410,7 @@ class WanService:
             return
         self.store.update(job["id"], status="completed", result_path=self.store.relative_data_path(output),
                           actual_metadata=json.dumps(actual, ensure_ascii=False),
-                          completed_at=time.time(), provider_url=None, download_attempts=0, error=None)
+                          completed_at=time.time(), provider_url=None, download_attempts=0, error=None, failure_details=None)
 
 
 def _error_payload(message, code="invalid_request_error", param=None):
@@ -1185,16 +1459,16 @@ def make_handler(service, token=None):
         def _get(self):
             path = urlsplit(self.path).path
             if path == "/health":
-                return self._json(200, {"status": "ok", "workers": len(service.workers)})
+                return self._json(200, {"status": "ok", "workers": len(service.workers),
+                                       "service_version": __version__, "protocol_version": PROTOCOL_VERSION})
             if not self._check_auth():
                 return
             if path.startswith("/v1/logins/"):
                 return self._json(200, service.logins.get(path.rsplit("/", 1)[-1]).snapshot())
             if path == "/v1/models":
-                return self._json(200, {"object": "list", "data": [
-                    {"id": alias, "object": "model", "created": 0, "owned_by": "modelscope", "kind": "video"}
-                    for alias in MODEL_IDS
-                ]})
+                return self._json(200, service.models())
+            if path == "/v1/diagnostics":
+                return self._json(200, service.diagnostics())
             if path == "/v1/media/roots":
                 return self._json(200, {"roots": [str(root) for root in service.media_roots]})
             if path == "/v1/accounts":
@@ -1293,7 +1567,8 @@ def make_handler(service, token=None):
             is_submit = path == "/v1/videos"
             is_validate = path == "/v1/frames/validate"
             is_resolve = len(parts) == 4 and parts[:2] == ["v1", "videos"] and parts[3] == "resolve"
-            if not is_submit and not is_resolve and not is_validate:
+            is_control = len(parts) == 4 and parts[:2] == ["v1", "videos"] and parts[3] == "control"
+            if not is_submit and not is_resolve and not is_validate and not is_control:
                 return self._json(404, _error_payload("Route not found.", "not_found_error"))
             if not self._check_auth():
                 return
@@ -1311,8 +1586,8 @@ def make_handler(service, token=None):
                 elif is_validate:
                     self._json(200, service.validate_frames(body))
                 else:
-                    job = service.resolve_unknown_submission(parts[2], body)
-                    self._json(200, service.public_job(job))
+                    job = service.control_job(parts[2], {**body, "action": "resolve"} if is_resolve else body)
+                    self._json(200, service.job_details(job))
             except json.JSONDecodeError:
                 self._json(400, _error_payload("request body must be valid JSON"))
             except ServiceError as exc:

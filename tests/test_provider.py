@@ -116,3 +116,11 @@ def test_upload_does_not_follow_redirects(tmp_path, monkeypatch):
         client.upload(frame, 16, 16)
     assert put.call_args.kwargs["allow_redirects"] is False
     assert client.post.call_count == 1
+
+
+def test_rejected_submission_without_reason_does_not_dump_response():
+    client = provider.MS.__new__(provider.MS)
+    client.post = Mock(return_value={'Data': {'success': False, 'private_cookie': 'never-save-this'}})
+    with pytest.raises(provider.SubmissionRejected) as error:
+        client.submit({})
+    assert str(error.value) == ''

@@ -2,7 +2,7 @@
 
 A standalone Magpie tools plugin and local Python service for submitting image-to-video jobs to WAN models through already signed-in ModelScope browser sessions.
 
-The package runs locally. Magpie calls seven tools; the Python service queues the request and continues polling ModelScope after the tool call returns:
+The package runs locally. Magpie calls eleven tools; the Python service queues the request and continues polling ModelScope after the tool call returns:
 
 - `wan_generate_flf2v`: generate from a first frame and a required final frame.
 - `wan_generate_i2v`: generate from a first frame.
@@ -11,6 +11,10 @@ The package runs locally. Magpie calls seven tools; the Python service queues th
 - `wan_get_config`: show allowed input directories and account connection/balance snapshots.
 - `wan_prepare_frames`: validate frames; explicitly set `copy_to_media_root=true` to stage outside images.
 - `wan_list_video_jobs`: list and paginate tasks, optionally filtered by project.
+- `wan_get_models`: list adapter model capabilities and local download verification times.
+- `wan_diagnose`: inspect plugin/service version compatibility, workers, accounts and affected jobs.
+- `wan_control_job`: pause/resume/cancel unsubmitted local jobs or explicitly reassign them.
+- `wan_reconcile_job`: reconcile an ambiguous submission with its original provider task.
 
 The service exposes `GET /v1/models`, `POST /v1/videos`, `GET /v1/videos/{id}` and `GET /v1/videos/{id}/content`. It binds to loopback by default. It does not require or store a ModelScope password or API key; it uses the browser sessions you configure.
 
@@ -50,6 +54,14 @@ Install FFmpeg if `ffprobe` is not already available. The service checks downloa
 
 ## Configure one or many ModelScope accounts
 
+For a new device, set `WAN_MEDIA_ROOTS` and start `magpie-wan-service` without
+`WAN_MODELSCOPE_ACCOUNTS` or `WAN_MODELSCOPE_CDP_URLS`. The service starts with zero
+accounts. Use **登录新账号** in Magpie to create each isolated browser session;
+saved sessions restart automatically. Chrome must be installed on that device.
+SMS/CAPTCHA and any new-device verification are completed by the user on the
+official site. Existing profiles and fingerprint databases are local to that
+installation; do not copy only the database onto a new device.
+
 For manual CDP configuration (an alternative to the managed GUI login below), start a separate Chrome/Chromium process with a separate user-data directory for each ModelScope account. Sign in to each profile and expose a different local CDP port. Keep each browser open while the service is running; do not share a profile between accounts. For example, on macOS:
 
 ```sh
@@ -81,7 +93,7 @@ $env:WAN_SERVICE_DATA_DIR = "$env:LOCALAPPDATA\magpie-wan"
 magpie-wan-service
 ```
 
-There is no two-account limit. The service starts one serial worker queue per configured account ID and assigns new jobs to the least-loaded queue. Open `https://modelscope.cn` or `https://www.modelscope.cn` and sign in in each browser profile. Other domains, HTTP pages, and redirects are rejected. Upload destinations must be official HTTPS ModelScope hosts or bucket-specific Alibaba OSS HTTPS endpoints; upload redirects are rejected.
+There is no two-account limit. The service starts one serial worker queue per configured account ID and assigns plugin jobs by the selected WAN routing mode (direct HTTP requests without a mode keep queue-based selection). Open `https://modelscope.cn` or `https://www.modelscope.cn` and sign in in each browser profile. Other domains, HTTP pages, and redirects are rejected. Upload destinations must be official HTTPS ModelScope hosts or bucket-specific Alibaba OSS HTTPS endpoints; upload redirects are rejected.
 
 Each ID is bound to a salted local fingerprint of its ModelScope login. The service checks the fingerprint before processing jobs, and the adapter checks the login before API operations. You can reorder the mapping or change a CDP port while keeping each ID with its original login. A different login or a duplicate identity blocks that worker. Use a new ID for a new account; never rename an ID with unfinished jobs. Choose generic IDs, since they appear in tool responses. Raw login IDs and CDP addresses are not persisted by the service. Display names are held in memory; connecting an account in Magpie saves its display label and configured account ID there.
 
@@ -120,11 +132,40 @@ Login has a nine-minute service deadline. Cancel from Magpie's login dialog or c
 
 Managed browsers use one private profile per account, run headless after login, and stay running after login to serve video tasks. They are stopped when the service stops and restarted with their saved profiles when the service starts. Session expiry still requires login again. Headless mode removes visible windows; it does not eliminate per-account Chrome memory consumption. Existing manually configured CDP browsers remain externally managed. Existing saved Magpie accounts continue to work; there is no separate browser-sync option in the login UI.
 
+A configured account with a private `browser-profiles/<account-id>` directory in the service data directory is managed by the service too. Its debugging port is allocated at startup and restored automatically; its database identity and job ownership remain unchanged. Manually configured accounts without such a directory remain externally managed. Managed ports never reuse another configured account's reserved port, even when that external browser is offline.
+
 To remove a saved sign-in, expand that account card's **设置** and click Magpie's native **移除** button. This removes that account's Magpie login, not the entire provider or the ModelScope account. It does not delete browser profiles, stop the independent WAN queue, or erase video history. The provider-level **移除** button has a different effect; use the per-account button.
 
-Each connected account has its own label and **可用魔粒** wallet in Providers and Usage. The plugin reads ModelScope's `available_balance`, not total credits including frozen amounts. Snapshots refresh about every 60 seconds when idle, and after submission/completion; a snapshot older than 120 seconds is marked stale and its balance hidden. A browser busy uploading/submitting can temporarily make its wallet stale. Unknown balances are not displayed as zero. `estimate_unit` is `魔粒`; `estimate` is a quoted generation cost, not seconds or a confirmed charge.
+Each connected account has its own label and **可用魔粒** wallet in Providers and Usage. The optional [native Magpie wallet-trend patch](patches/README.md) adds per-account balance history when expanded and a combined history when folded; it requires a patched Magpie build, not only this plugin. The plugin reads ModelScope's `available_balance`, not total credits including frozen amounts. Snapshots refresh about every 60 seconds when idle, and after submission/completion; a snapshot older than 120 seconds is marked stale and its balance hidden. A browser busy uploading/submitting can temporarily make its wallet stale. Unknown balances are not displayed as zero. `estimate_unit` is `魔粒`; `estimate` is a quoted generation cost, not seconds or a confirmed charge.
 
 This provider is an account/usage integration with no chat models. Generate through the WAN tools. Magpie's provider account switches do not control the service's independent video queues; use the submission's optional `account` ID when a specific queue is needed. Browser logins are not automatically written into Magpie's sign-in store: use the native login flow, so signing out in Magpie stays signed out until you explicitly sign in again.
+
+### WAN account routing
+
+The provider editor's **均衡负载（剩余魔粒最多优先）** switch is on by default.
+It controls WAN video tools, independently of Magpie's general model routing.
+Every submission picks the connected account with the largest fresh, positive
+`available_balance` (a max-priority-queue top). Equal balances prefer the shorter
+active queue, then account ID for a stable tie. Expired snapshots, unknown/zero
+balances, rejected sessions and accounts signing in are excluded. If none are
+eligible, the service returns an error instead of queuing against a broken login.
+
+Turn the switch off for **preferred** mode. The plugin's `preferredAccount`
+option supplies the preferred account ID; when omitted, the first eligible
+account in service order is used. An explicitly configured unavailable preferred
+account returns an error. Each generation call can override with
+`routing: "balanced" | "preferred"` and `preferred_account: "account-2"`.
+An explicit `account` always pins the job to that account. `wan_get_config`
+reports the effective mode. Outside Magpie the plugin's `routing` option defaults
+to `balanced`. Direct HTTP requests omitting `routing` retain legacy queue-only
+selection for compatibility.
+
+Selection and insertion are serialized for concurrent submissions; retries with
+the same idempotency key retain their original job/account. Balances are official
+snapshots (normally refreshed every 60 seconds and after submission/completion),
+not speculative cost reservations: consecutive requests may choose the same
+highest-balance account until its reported balance changes. This is not a
+guarantee that the wallet can cover a job's as-yet-unknown quote.
 
 ## Frame preparation, projects and completion
 
@@ -180,6 +221,54 @@ curl -X POST http://127.0.0.1:8765/v1/videos/JOB_ID/resolve \
 
 When `WAN_SERVICE_TOKEN` is set, pass the matching bearer token to these requests too.
 
+## Diagnose and recover tasks
+
+Run `wan_diagnose` after upgrading. It compares plugin/service version and protocol,
+checks live worker threads and input roots, and lists jobs affected by unavailable
+accounts or ambiguous submissions. `compatible` means matching code versions,
+not that the account network checks all passed; inspect `accounts` and `workers`.
+
+Status and list tools preserve `provider_status` / `last_confirmed_provider_status`
+as the last observed provider fact. `phase` and `progress_message` highlight the
+current obstacle; `execution_phase` retains the original local processing phase.
+`connection`, `blockage` and `timing` expose account availability, the blocking job,
+waiting job IDs, queue duration, time since submission and last successful poll.
+Generation elapsed time is wall time since submission, not measured compute time.
+Connection outage time is measured since this service process detected it; old
+jobs without submission timestamps report that duration as unknown.
+
+`wan_get_video_status` includes the latest 100 persistent `events`. History starts
+with this upgrade and cannot reconstruct earlier uploads or submissions. Poll
+success time is stored on each query; events record provider state changes and
+poll failures/recovery rather than every identical poll. `failure` includes stage,
+allowlisted error code/reason and HTTP status where supplied. Raw exceptions and
+entire provider responses are not persisted. No supplied reason means **服务端未提供原因**.
+`recovery.safe_to_resubmit` describes duplicate-generation safety, not the chance
+of visual success. Actual charges remain unknown unless the provider verifies
+one; `estimate` is only a quote.
+
+Use `wan_control_job` with `action: "pause" | "resume" | "cancel" | "reassign"`
+and `job_id`; reassign also requires a connected destination `account`. Only
+`queued` or `paused` jobs without a provider task ID qualify. Paused jobs leave
+the runnable queue; cancelled jobs retain their inputs/history. Cancel means
+cancel local waiting only, not cancel a ModelScope generation or delete a file.
+If the worker is currently operating on that account, the operation returns busy
+and can be retried. Existing provider IDs and uncertain submissions cannot be
+cancelled or reassigned locally. Reassignment preserves the job ID and records
+the account change; the idempotency key continues referring to that same job.
+
+For `unknown_submission`, use `wan_reconcile_job` with **exactly one** of
+`provider_task_id` or `confirm_no_task: true`, after checking the original
+ModelScope account. Linking an ID only resumes querying that ID; it is not an
+assertion that a remote task exists. Never confirm absence just because a status
+query failed. The original account and history are retained.
+
+`wan_get_models` exposes three adapter-supported models including
+`wan2.2-ti2v-5b`. Limits describe local validation, not live provider guarantees.
+`last_local_download_success_at` is evidence of a downloaded file, not content
+acceptance; `quality_acceptance` remains `not_evaluated`. No model is marked as
+meeting an action requirement solely because its prompt requested that action.
+
 ## Upgrade and migrate existing jobs
 
 1. Stop the old service and back up the entire private data directory. Copy it only while the service is stopped, including the database, any SQLite sidecars, input frames and videos.
@@ -193,7 +282,7 @@ Expired video URLs (401/403, or three other failed downloads/validations) are cl
 
 ## Validation and release
 
-Run `python -m pip install -e '.[test]'`, `python -m pytest -q`, and `npm test` for the offline regression suite. These tests use mocked provider sessions and local HTTP servers, not browsers. The CI workflow checks Linux and Windows, installs an npm tarball into a clean directory with an isolated npm cache, imports its seven tools, and installs the Python service from the same packaged source. A configured workflow is not evidence of a successful run: require it to pass before release. Real ModelScope login, upload and generation still need a separate end-to-end check on a suitable machine.
+Run `python -m pip install -e '.[test]'`, `python -m pytest -q`, and `npm test` for the offline regression suite. These tests use mocked provider sessions and local HTTP servers, not browsers. The CI workflow checks Linux, Windows and macOS, installs an npm tarball into a clean directory with an isolated npm cache, imports its eleven tools, and installs the Python service from the same packaged source. A configured workflow is not evidence of a successful run: require it to pass before release. Real ModelScope login, upload and generation still need a separate end-to-end check on a suitable machine.
 
 Before distributing, run `npm pack --dry-run --json` and inspect the whitelist (entry point, package metadata, Python source and documentation only). `npm pack` creates the distributable tarball; a recipient can extract it, follow the Python setup above, install npm dependencies, and run `magpie plugin add .`. No npm registry release is assumed to exist. Publishing requires a chosen license, release destination and a successful clean-install CI run; this change does not publish anything. Never distribute the runtime data directory, browser profiles or an unrelated workspace.
 
@@ -206,3 +295,14 @@ See [PRIVACY.md](PRIVACY.md) for data flow, local storage, and the privacy audit
 The [official Magpie plugin documentation](https://usemagpie.ai/docs/plugins#publishing) says that a public, non-fork, non-archived repository with the GitHub **topic** `magpie-plugin` appears under **Plugins → Discover → Unofficial, on GitHub**. This is a repository topic, not a Git tag/release or an npm keyword.
 
 On the repository page, use the gear next to **About**, add `magpie-plugin` under **Topics**, and save. Keep `package.json` at the repository root and the loaded `index.mjs` committed. Magpie checks GitHub at most every ten minutes; indexing can also take time. With a published npm package whose `repository` points here, Magpie installs npm; otherwise it installs the committed repository. Optional `magpie.name`, `magpie.summary` and `magpie.icon` metadata customize its card. Choose a license before public distribution. This work does not add the topic, publish a package, or submit to the curated community catalog.
+
+### Video calls in Magpie Routing
+
+The generation tools opt into the [native plugin-video routing patch](patches/README.md).
+With that patched Magpie installed, agent submissions appear in Routing
+with agent, model, account, duration, submission result and WAN job ID.
+Open **Request and response** for the returned job status. HTTP 200 means
+submission succeeded; use `wan_get_video_status` for the ongoing generation
+and `wan_get_video_result` for the completed video. Polls and downloads do
+not create duplicate generation rows. Older calls are not backfilled.
+Official Magpie without this patch continues running all tools normally.

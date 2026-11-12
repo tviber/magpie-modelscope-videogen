@@ -23,8 +23,8 @@ async function fixture(t, handler, options = {}) {
     await rm(outputDir, { recursive: true, force: true })
   })
   const opts = { serverUrl: `http://127.0.0.1:${server.address().port}`, outputDir, ...options }
-  const plugin = await MagpieWanTools({}, opts)
-  assert.equal(Object.keys(plugin.tool).length, 7)
+  const plugin = await MagpieWanTools(options.testInput || {}, opts)
+  assert.equal(Object.keys(plugin.tool).length, 11)
   return { tool: plugin.tool.wan_get_video_result, outputDir, tools: plugin.tool, plugin, options: opts }
 }
 
@@ -57,6 +57,17 @@ test("unfinished result returns status without creating an artifact", async t =>
   assert.deepEqual(await readdir(outputDir), [])
 })
 
+test("only video submissions opt into native Magpie routing history", async t => {
+  const { tools } = await fixture(t, (_req, res) => res.end("{}"))
+  assert.deepEqual(tools.wan_generate_i2v.magpie.route, {
+    provider: "modelscope-wan", modelArg: "model", defaultModel: "wan2.2-i2v-a14b",
+  })
+  assert.equal(tools.wan_generate_flf2v.magpie.route.defaultModel, "wan2.1-flf2v-14b")
+  for (const [name, definition] of Object.entries(tools)) {
+    if (!name.startsWith("wan_generate_")) assert.equal(definition.magpie?.route, undefined, name)
+  }
+})
+
 test("submit checks the allowed roots before posting and can copy an outside frame", async t => {
   const sourceDir = await mkdtemp(join(tmpdir(), "wan-outside-"))
   const source = join(sourceDir, "frame.png")
@@ -81,6 +92,11 @@ test("submit checks the allowed roots before posting and can copy an outside fra
   await tools.wan_generate_i2v.execute({ ...args, copy_to_media_root: true }, { abort: new AbortController().signal })
   assert.ok(submitted.first_frame.includes("wan-media-"))
   assert.ok(submitted.first_frame !== source)
+  assert.equal(submitted.routing, "balanced")
+  await tools.wan_generate_i2v.execute({ ...args, copy_to_media_root: true,
+    routing: "preferred", preferred_account: "account-2" }, {})
+  assert.equal(submitted.routing, "preferred")
+  assert.equal(submitted.preferred_account, "account-2")
 })
 
 test("one plugin export and independent account labels and magicube wallets", async t => {
@@ -354,4 +370,52 @@ test("repeat login saves verified original account while retaining task correlat
   const result = await (await plugin.auth.methods[0].authorize()).callback()
   assert.equal(result.type, 'success')
   assert.equal(result.key, 'old')
+})
+
+
+test("Magpie balance switch and standalone options expose the effective routing", async t => {
+  let balanced = true
+  const { tools, plugin } = await fixture(t, (_req, res) => res.end('{"roots":[]}'), {
+    preferredAccount: "account-2", testInput: { magpie: { option(provider, key) {
+      assert.equal(provider, "modelscope-wan")
+      assert.equal(key, "balance_routing")
+      return balanced
+    } } },
+  })
+  assert.equal(plugin.auth.options[0].default, true)
+  assert.equal((await tools.wan_get_config.execute()).routing, "balanced")
+  balanced = false
+  const config = await tools.wan_get_config.execute()
+  assert.equal(config.routing, "preferred")
+  assert.equal(config.preferred_account, "account-2")
+  const standalone = await fixture(t, (_req, res) => res.end('{"roots":[]}'), { routing: "preferred" })
+  assert.equal((await standalone.tools.wan_get_config.execute()).routing, "preferred")
+})
+
+
+test("operational tools send local controls and explicit reconciliation and check service protocol", async t => {
+  const seen = []
+  let protocol = 2
+  const { tools } = await fixture(t, async (req, res) => {
+    if (req.url === '/health') return res.end(JSON.stringify({ protocol_version: protocol, service_version: '0.0.1' }))
+    if (req.url === '/v1/diagnostics') return res.end('{"workers":[],"accounts":[],"affected_jobs":[]}')
+    if (req.url === '/v1/models') return res.end('{"data":[{"id":"wan2.2-ti2v-5b"}]}')
+    if (req.method === 'POST') {
+      let body = ''
+      for await (const chunk of req) body += chunk
+      seen.push({ url: req.url, body: JSON.parse(body) })
+      return res.end('{"id":"job","status":"paused"}')
+    }
+    res.writeHead(404).end()
+  })
+  assert.equal((await tools.wan_get_models.execute({})).data[0].id, 'wan2.2-ti2v-5b')
+  assert.equal((await tools.wan_diagnose.execute({})).compatible, true)
+  protocol = 1
+  assert.equal((await tools.wan_diagnose.execute({})).compatible, false)
+  await tools.wan_control_job.execute({ job_id: 'job', action: 'reassign', account: 'b' })
+  await tools.wan_reconcile_job.execute({ job_id: 'job', provider_task_id: 'remote' })
+  assert.deepEqual(seen, [
+    { url: '/v1/videos/job/control', body: { action: 'reassign', account: 'b' } },
+    { url: '/v1/videos/job/resolve', body: { provider_task_id: 'remote' } },
+  ])
 })

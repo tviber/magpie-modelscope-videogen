@@ -1,0 +1,318 @@
+--- a/internal/plugin/tools.go
++++ b/internal/plugin/tools.go
+@@ -22,9 +22,18 @@
+ // Tool is a tool a plugin gives: OpenCode's tool hook ({tool: {name:
+ // tool({description, args, execute})}}), which magpie offers every agent
+ // through its plugin tools MCP server (internal/gateway/tools_mcp.go).
++// ToolRoute opts a submitting tool into native routing history. Polling and
++// result tools leave it unset: an accepted asynchronous job is one submission.
++type ToolRoute struct {
++	Provider     string `json:"provider"`
++	ModelArg     string `json:"modelArg,omitempty"`
++	DefaultModel string `json:"defaultModel"`
++}
++
+ type Tool struct {
+-	Name        string `json:"name"`
+-	Description string `json:"description,omitempty"`
++	Name        string     `json:"name"`
++	Route       *ToolRoute `json:"route,omitempty"`
++	Description string     `json:"description,omitempty"`
+ 	// Schema is its arguments as JSON Schema, made in the host from its
+ 	// zod shape
+ 	Schema json.RawMessage `json:"schema,omitempty"`
+--- a/internal/plugin/host.js
++++ b/internal/plugin/host.js
+@@ -1886,7 +1886,12 @@
+     } catch {
+       schema = { type: "object", properties: {} }
+     }
+-    out.push({ name, description: shown(def.description, 2000), schema })
++    const r = def.magpie?.route
++    const route = r && typeof r.provider === "string" && /^[a-z0-9][a-z0-9-]{0,63}$/.test(r.provider)
++      && typeof r.defaultModel === "string" && r.defaultModel.length > 0 && r.defaultModel.length <= 160
++      && (r.modelArg === undefined || typeof r.modelArg === "string" && /^[A-Za-z0-9_]{1,64}$/.test(r.modelArg))
++      ? { provider: r.provider, defaultModel: r.defaultModel, modelArg: r.modelArg } : undefined
++    out.push({ name, description: shown(def.description, 2000), schema, ...(route ? { route } : {}) })
+   }
+   return out
+ }
+--- a/internal/gateway/tools_mcp.go
++++ b/internal/gateway/tools_mcp.go
+@@ -215,6 +215,16 @@
+ 	if !slices.ContainsFunc(ts, func(t plugin.Tool) bool { return t.Name == tool }) {
+ 		return "", fmt.Errorf("the plugin %s isn't on in magpie, or gives no tool %s", name, tool)
+ 	}
++	var def plugin.Tool
++	for _, t := range ts {
++		if t.Name == tool {
++			def = t
++			break
++		}
++	}
++	if call, ok := ctx.Value(pluginRouteKey{}).(pluginRouteCaller); ok {
++		return call.s.runRoutedPluginTool(call.r.WithContext(ctx), spec, def, args, agent)
++	}
+ 	return runPluginTool(ctx, spec, tool, args, agent)
+ }
+ 
+@@ -293,5 +303,5 @@
+ 		return "", err
+ 	}
+ 	defer release()
+-	return runPluginTool(r.Context(), t.spec, t.Name, args, callerOf(r).agent)
+-}
++	return s.runRoutedPluginTool(r, t.spec, t.Tool, args, callerOf(r).agent)
++}
+--- a/internal/gateway/hub_mcp.go
++++ b/internal/gateway/hub_mcp.go
+@@ -757,6 +757,7 @@
+ 	}
+ 	ctx, cancel := context.WithTimeout(r.Context(), hubCallWait)
+ 	defer cancel()
++	ctx = context.WithValue(ctx, pluginRouteKey{}, pluginRouteCaller{s: s, r: r})
+ 	res, err := MCPHub.Call(ctx, agent, t.Server, t.Tool, args)
+ 	if err != nil {
+ 		why := err.Error()
+--- /dev/null
++++ b/internal/gateway/plugin_tool_route.go
+@@ -0,0 +1,81 @@
++package gateway
++
++import (
++	"encoding/json"
++	"net/http"
++	"time"
++
++	"github.com/yetone/magpie/internal/plugin"
++	"github.com/yetone/magpie/internal/provider"
++	"github.com/yetone/magpie/internal/usage"
++)
++
++type pluginRouteKey struct{}
++type pluginRouteCaller struct {
++	s *Server
++	r *http.Request
++}
++
++// runRoutedPluginTool records only tools that explicitly opt in. Both MCP
++// entry points and the Library hub use this path. It observes one tool call,
++// never repeats it, and never treats accepting a job as finishing its video.
++func (s *Server) runRoutedPluginTool(r *http.Request, spec string, def plugin.Tool, args json.RawMessage, agent string) (string, error) {
++	if def.Route == nil {
++		return runPluginTool(r.Context(), spec, def.Name, args, agent)
++	}
++	start := time.Now()
++	var in map[string]json.RawMessage
++	_ = json.Unmarshal(args, &in)
++	model := def.Route.DefaultModel
++	if b := in[def.Route.ModelArg]; len(b) > 0 {
++		var m string
++		if json.Unmarshal(b, &m) == nil && m != "" && len(m) <= 160 {
++			model = m
++		}
++	}
++	pid := provider.PluginID(def.Route.Provider)
++	mcpUseOf(r.Context()).used(pid, model)
++	name := def.Route.Provider
++	if p, e := provider.Find(pid); e == nil && p.Name != "" {
++		name = p.Name
++	}
++	rt := s.trace.beginFor(r, Route{Time: start, Agent: agent, Session: sessionOf(r.Header), Kind: usage.KindMCP, Model: pid + "/" + model, Provider: pid, Order: []Weighed{{ID: pid, Provider: pid, Name: name, Kind: "provider", Model: model}}, Tries: []Try{{ID: pid, Model: model, Start: start, SentBy: "plugin"}}})
++	said, err := runPluginTool(r.Context(), spec, def.Name, args, agent)
++	status := http.StatusOK
++	why := ""
++	if err != nil {
++		status = http.StatusBadGateway
++		why = err.Error()
++		if r.Context().Err() != nil {
++			status = usage.StatusCanceled
++			why = usage.AgentCanceled
++		}
++	}
++	// Only these identifiers describe the submission; arbitrary tool output,
++	// prompts, frame paths, provider URLs and authentication never enter the log.
++	var result struct {
++		ID      string `json:"id"`
++		Status  string `json:"status"`
++		Account string `json:"account_id"`
++	}
++	_ = json.Unmarshal([]byte(said), &result)
++	result.ID = cutName(result.ID, 200)
++	result.Status = cutName(result.Status, 64)
++	result.Account = cutName(result.Account, 100)
++	response, _ := json.Marshal(map[string]any{"operation": "video_submission", "job_id": result.ID, "job_status": result.Status, "account_id": result.Account, "generation_completed": result.Status == "completed"})
++	request, _ := json.Marshal(map[string]string{"tool": def.Name, "model": model, "operation": "video_submission"})
++	ms := time.Since(start).Milliseconds()
++	s.record(Call{Route: rt.ID, Time: start, Agent: agent, Kind: usage.KindMCP, Model: model, Provider: pid, From: "mcp", To: "plugin", Status: status, Millis: ms, Error: why, RequestBody: string(request), ResponseBody: string(response)})
++	s.trace.update(rt, func(t *Route) {
++		t.Done, t.Status, t.Millis, t.Error = true, status, ms, why
++		t.ResponseID = result.ID
++		t.Tries[0].Done, t.Tries[0].Status, t.Tries[0].Millis, t.Tries[0].Error = true, status, ms, why
++		if result.Account != "" {
++			t.Order[0].Who = result.Account
++			t.Order[0].ID = pid + "@" + result.Account
++			t.Order[0].Kind = "account"
++			t.Tries[0].ID = t.Order[0].ID
++		}
++	})
++	return said, err
++}
+--- /dev/null
++++ b/internal/gateway/plugin_tool_route_test.go
+@@ -0,0 +1,100 @@
++package gateway
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"github.com/yetone/magpie/internal/access"
++	"github.com/yetone/magpie/internal/plugin"
++	"net/http/httptest"
++	"strings"
++	"testing"
++)
++
++func TestPluginVideoSubmissionRoutes(t *testing.T) {
++	fresh(t)
++	def := plugin.Tool{Name: "wan_generate_i2v", Route: &plugin.ToolRoute{Provider: "modelscope-wan", ModelArg: "model", DefaultModel: "wan2.2-i2v-a14b"}}
++	fakePluginTools(t, []plugin.PluginTools{{Spec: "/plugins/magpie-modelscope-wan", Tools: []plugin.Tool{def, {Name: "wan_get_video_status"}}}})
++	old := runPluginTool
++	calls := 0
++	runPluginTool = func(context.Context, string, string, json.RawMessage, string) (string, error) {
++		calls++
++		return `{"id":"wan-job-123","status":"queued","account_id":"account-2","prompt":"private prompt","first_frame":"/private/frame.png"}`, nil
++	}
++	t.Cleanup(func() { runPluginTool = old })
++	s := New()
++	w := toolsPost(s.Handler(), toolsCall("magpie-modelscope-wan_wan_generate_i2v", `{"model":"wan2.2-ti2v-5b","prompt":"private prompt"}`), "User-Agent", "codex/1.0", SessionHeader, "session-video")
++	m := readMCP(t, w)
++	if m.Result.IsError {
++		t.Fatalf("submission: %s", w.Body)
++	}
++	rows := s.Trace(context.Background(), 0, 0).Routes
++	if len(rows) != 1 {
++		t.Fatalf("video submission missing from Routing: %+v", rows)
++	}
++	rt := rows[0]
++	if rt.ResponseID != "wan-job-123" {
++		t.Fatalf("durable job ID missing: %+v", rt)
++	}
++	if !rt.Done || rt.Status != 200 || rt.Model != "modelscope-wan/wan2.2-ti2v-5b" || rt.Agent != "codex" || rt.Session != "session-video" || len(rt.Tries) != 1 || rt.Order[0].Who != "account-2" {
++		t.Fatalf("route: %+v", rt)
++	}
++	call, ok := s.RouteCall(rt.ID)
++	if !ok || !strings.Contains(call.ResponseBody, `"job_status":"queued"`) || !strings.Contains(call.ResponseBody, `"generation_completed":false`) || strings.Contains(call.RequestBody+call.ResponseBody, "private") {
++		t.Fatalf("submission result: %+v", call)
++	}
++	toolsPost(s.Handler(), toolsCall("magpie-modelscope-wan_wan_get_video_status", `{"job_id":"wan-job-123"}`))
++	if len(s.Trace(context.Background(), 0, 0).Routes) != 1 || calls != 2 {
++		t.Fatal("poll duplicated submission route or tool was repeated")
++	}
++	runPluginTool = func(context.Context, string, string, json.RawMessage, string) (string, error) {
++		return "", errors.New("frame cannot be read")
++	}
++	_, err := s.runRoutedPluginTool(httptest.NewRequest("POST", "/mcp", nil), "/plugins/magpie-modelscope-wan", def, nil, "claude")
++	rows = s.Trace(context.Background(), 0, 0).Routes
++	if err == nil || len(rows) != 2 || rows[1].Status != 502 || rows[1].Error != "frame cannot be read" {
++		t.Fatalf("failure lost: %+v %v", rows, err)
++	}
++}
++
++func TestPluginVideoSubmissionRoutesThroughHub(t *testing.T) {
++	fresh(t)
++	def := plugin.Tool{Name: "wan_generate_i2v", Route: &plugin.ToolRoute{Provider: "modelscope-wan", DefaultModel: "wan2.2-i2v-a14b"}}
++	fakePluginTools(t, []plugin.PluginTools{{Spec: "magpie-modelscope-wan", Tools: []plugin.Tool{def}}})
++	old := MCPHub
++	MCPHub = &fakeHub{on: true, call: func(ctx context.Context, server, tool string) (json.RawMessage, error) {
++		said, err := RunPluginToolOf(ctx, "magpie-modelscope-wan", tool, json.RawMessage(`{}`), "codex")
++		if err != nil {
++			return nil, err
++		}
++		return json.Marshal(map[string]string{"text": said})
++	}}
++	t.Cleanup(func() { MCPHub = old })
++	s := New()
++	r := httptest.NewRequest("POST", "/mcp/magpie/hub/codex", nil)
++	r.Header.Set(SessionHeader, "hub-video")
++	s.hubMCPRun(r, "codex", hubTool{HubTool: HubTool{Server: "wan", Tool: "wan_generate_i2v"}, name: "wan__wan_generate_i2v"}, json.RawMessage(`{}`))
++	rows := s.Trace(context.Background(), 0, 0).Routes
++	if len(rows) != 1 || rows[0].Agent != "codex" || rows[0].Session != "hub-video" {
++		t.Fatalf("hub submission missing or duplicated: %+v", rows)
++	}
++}
++
++func TestPluginVideoRouteCallerAndCanceled(t *testing.T) {
++	fresh(t)
++	fakePluginTools(t, nil)
++	old := runPluginTool
++	runPluginTool = func(context.Context, string, string, json.RawMessage, string) (string, error) {
++		return "", context.Canceled
++	}
++	t.Cleanup(func() { runPluginTool = old })
++	ctx, cancel := context.WithCancel(access.WithIdentity(context.Background(), access.Identity{KeyID: "caller-key", KeyName: "Laptop"}))
++	cancel()
++	r := httptest.NewRequest("POST", "/mcp", nil).WithContext(ctx)
++	s := New()
++	_, err := s.runRoutedPluginTool(r, "wan", plugin.Tool{Name: "submit", Route: &plugin.ToolRoute{Provider: "modelscope-wan", DefaultModel: "wan-test"}}, nil, "codex")
++	rows := s.Trace(context.Background(), 0, 0).Routes
++	if err == nil || len(rows) != 1 || rows[0].CallerKey != "caller-key" || rows[0].CallerKeyName != "Laptop" || rows[0].Status != 499 || !rows[0].Canceled {
++		t.Fatalf("canceled caller: %+v %v", rows, err)
++	}
++}
+--- a/internal/plugin/tools_test.go
++++ b/internal/plugin/tools_test.go
+@@ -40,6 +40,12 @@
+ 	}
+ 	if strings.Join(names, " ") != "shout add sleep fail" {
+ 		t.Fatalf("tool names = %v", names)
++	}
++	if tr := by["add"].Route; tr == nil || tr.Provider != "test-video" || tr.DefaultModel != "test-model" || tr.ModelArg != "model" {
++		t.Fatalf("submission metadata lost: %+v", tr)
++	}
++	if by["shout"].Route != nil {
++		t.Fatal("ordinary tool opted into route history")
+ 	}
+ 	if by["shout"].Description != "Says the text back in capitals." {
+ 		t.Errorf("shout's description = %q", by["shout"].Description)
+--- a/internal/plugin/testdata/tools/index.js
++++ b/internal/plugin/testdata/tools/index.js
+@@ -45,6 +45,7 @@
+     },
+     // a JSON Schema, and an answer that is no string
+     add: {
++      magpie: { route: { provider: "test-video", modelArg: "model", defaultModel: "test-model" } },
+       description: "Adds numbers.",
+       args: { type: "object", properties: { xs: { type: "array", items: { type: "number" } } }, required: ["xs"] },
+       execute: async ({ xs }) => ({ sum: xs.reduce((a, b) => a + b, 0) }),
+--- a/docs/subsystems/plugin-tools.md
++++ b/docs/subsystems/plugin-tools.md
+@@ -66,3 +66,27 @@
+ | Sign in | An entry with `auth` (`SearchVendor.Auth`) is ready with no key. `askSearchAPIKeys` hands it to `askSearchSignedIn`: `provider.SearchSignIn` finds the plugin's provider (`plugin:<auth>` of the same plugin) and its name; none is "not signed in to X: sign in to it on Providers", and the next search API is asked. Its accounts are the ones a model request takes (`accountsOn`: own unless paused, then `AlsoOn`, by `LoginRanks`), in `searchKeyOrder`'s order, each with a quarter of the search's limit, a request-log row named by the account's user and its own search rest (`searchKeyID` of `account <key>`); a refusal rests it for search only (`restSearchKey`), never `restingUntil`, and the next account is asked. `plugin.RunSearchAs` sends the account's key and its proxy; the host's `runSearch` checks the key is this provider's and signed in, renews it under `fresh` (its wait counts within the call's time, `late`; an account signed out mid-renewal stays out and the search fails), runs the hook inside `inScope`, so a token it saves with `client.auth.set` goes to that account, and gives `ctx.getAuth()` a copy of that account alone. The GUI's `searchVendorJSON.auth` says the provider's name, whether it is signed in and how many accounts are on (`gateway.SearchAccountsOn`); `settings.js` shows that in the key's place. | [`search_signin.go`](../../internal/gateway/search_signin.go), [`search_signin.go`](../../internal/provider/search_signin.go), `runSearch` in `host.js`, `RunSearchAs` in `search.go` |
+ 
+ Constraints: the plugin runs with the user's rights and sees the key and the (masked) query, as a built-in's vendor does. A backup or sync that restores search APIs on a computer without the plugin drops the plugin's entry there (`RestoreSearchAPIs` keeps only vendors it knows). The vendor list is read from the last load's note, so a plugin just added is listed after the host has loaded it. Tests: `TestPluginSearch` (host, `testdata/search`), `TestPluginSearchSignsIn` (host, `testdata/searchauth`: the chosen account's sign-in only, renewed when due within the timeout, an unknown or other provider's account refused, unbound entries unchanged), `TestPluginSearchAPI`, `TestPluginSearchAPISeesMaskedQuery` and `TestPluginSearchSignsIn` (gateway: signed out falls through to the next API, accounts off are skipped, a 429 rests the account for search and not for models), and `search-signs-in.test.cjs` (GUI).
++
++## Submission tools in Routing
++
++A tool may opt into native routing history with
++`magpie: {route: {provider, modelArg?, defaultModel}}`. The host validates
++and exposes this optional metadata on `plugin.Tool.Route`; ordinary tools
++remain unchanged. `runRoutedPluginTool` records one tool execution in the
++same gateway trace and recent-call ring as other requests. Direct plugin
++MCP, the per-plugin endpoint and the Library hub all reach it; caller key,
++agent and explicit session headers are retained. It neither retries nor
++submits a second generation. Poll/status/download tools opt out.
++
++For asynchronous video submissions, HTTP 200 means the submitting tool
++returned, not that video generation finished. Recent-call response details
++contain only operation, job ID, reported job status, account ID and an
++explicit generation-completed flag. The durable route stores the returned
++job ID as responseId. No prompt, media bytes, frame path or arbitrary tool
++output is copied into these details, and no token or monetary charge is
++inferred. Generation progress remains available through the plugin's status
++tool. Old tool calls made before this integration have no routing record.
++
++Tests: `TestPluginVideoSubmissionRoutes`,
++`TestPluginVideoSubmissionRoutesThroughHub`,
++`TestPluginVideoRouteCallerAndCanceled`, and `TestPluginTools`.

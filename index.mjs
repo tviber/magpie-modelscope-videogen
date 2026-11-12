@@ -10,6 +10,8 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
 
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
+const PLUGIN_VERSION = "0.0.1"
+const PROTOCOL_VERSION = 2
 
 function serviceUrl(options) {
   const base = String(options?.serverUrl || DEFAULT_SERVER_URL).replace(/\/+$/, "")
@@ -97,13 +99,15 @@ function generateArgs(includeLastFrame, defaultModel) {
     first_frame: tool.schema.string().min(1).describe("Absolute local path to the first frame image."),
     seconds: tool.schema.number().int().min(1).max(10).optional().describe("Duration in whole seconds (1–10). Defaults to 5."),
     size: tool.schema.string().optional().describe("Optional output dimensions such as 1280x720; must preserve the frame aspect ratio."),
-    model: tool.schema.string().optional().describe(`Model id; defaults to ${defaultModel}.`),
+    model: tool.schema.enum(["wan2.1-flf2v-14b", "wan2.2-i2v-a14b", "wan2.2-ti2v-5b"]).optional().describe(`Model id; defaults to ${defaultModel}. Use wan_get_models for adapter capabilities.`),
     style: tool.schema.string().optional().describe("Optional style text supplied for this request only."),
     negative_prompt: tool.schema.string().optional().describe("Optional negative prompt supplied for this request only."),
     seed: tool.schema.number().int().min(-1).optional().describe("Seed, or -1 for the provider default."),
     project: tool.schema.string().max(160).optional().describe("Optional project or shot group name."),
     shot: tool.schema.string().max(160).optional().describe("Optional shot name within the project."),
     account: tool.schema.string().optional().describe("Optional configured ModelScope account ID, such as account-1."),
+    routing: tool.schema.enum(["preferred", "balanced"]).optional().describe("preferred uses the preferred account; balanced picks the highest fresh available magicube balance, then the shortest queue. Explicit account overrides routing."),
+    preferred_account: tool.schema.string().optional().describe("Preferred account ID for preferred routing. Defaults to the plugin setting."),
     copy_to_media_root: tool.schema.boolean().optional().describe("Copy frames into the service's allowed input directory when they are outside it."),
     idempotency_key: tool.schema.string().optional().describe("Optional key to return the same job for retries of this exact request."),
   }
@@ -115,6 +119,7 @@ function generateArgs(includeLastFrame, defaultModel) {
 
 function submitTool(options, includeLastFrame, defaultModel, watch) {
   return tool({
+    magpie: { route: { provider: "modelscope-wan", modelArg: "model", defaultModel } },
     description: includeLastFrame
       ? "Submit a WAN first-frame-to-last-frame video job. Returns a durable job id immediately; use wan_get_video_status to check progress."
       : "Submit a WAN first-frame-to-video job. Returns a durable job id immediately; use wan_get_video_status to check progress.",
@@ -133,6 +138,8 @@ function submitTool(options, includeLastFrame, defaultModel, watch) {
         project: args.project,
         shot: args.shot,
         account: args.account,
+        routing: args.routing || options?.routing || "balanced",
+        preferred_account: args.preferred_account || options?.preferredAccount,
         idempotency_key: args.idempotency_key,
       }
       const prepared = await prepareFrames({ ...args, last_frame: includeLastFrame ? args.last_frame : undefined }, options, ctx.abort)
@@ -290,6 +297,7 @@ function completionWatcher(input, options) {
       for (const id of [...pending]) {
         try {
           const job = await request(options, `/v1/videos/${encodeURIComponent(id)}`)
+          if (job.status === "cancelled") { pending.delete(id); await persist(); continue }
           if (!["completed", "failed"].includes(job.status)) continue
           let result = job
           if (job.status === "completed") result = await downloadResult(options, id)
@@ -314,6 +322,11 @@ const PROVIDER = "modelscope-wan"
 const CONNECT_ACCOUNT_ENV = "WAN_MAGPIE_CONNECT_ACCOUNT"
 
 export const MagpieWanTools = async (input = {}, options = {}) => {
+  const configuredOptions = options
+  options = { ...configuredOptions, get routing() {
+    if (input.magpie?.option) return input.magpie.option(PROVIDER, "balance_routing") ? "balanced" : "preferred"
+    return configuredOptions.routing || "balanced"
+  } }
   const watch = completionWatcher(input, options)
   const icon = `data:image/png;base64,${await readFile(fileURLToPath(new URL("./assets/modelscope-icon.png", import.meta.url)), "base64")}`
   const connectAccount = async (account, signal) => {
@@ -333,6 +346,8 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
     auth: {
       provider: PROVIDER,
       icon,
+      options: [{ key: "balance_routing", label: "均衡负载（剩余魔粒最多优先）", default: true,
+        placement: "top", description: "开启后优先使用最新有效余额最多的账号；余额相同时选队列最短。关闭后使用 WAN 首选账号（未指定时按服务账号顺序）。" }],
       methods: [
         { type: "oauth", label: "登录新账号",
           async authorize(inputs, { signal } = {}) {
@@ -397,12 +412,29 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
           signIn: profile.session_error && /HTTP 401|rejected/i.test(profile.session_error) ? "expired" : undefined,
           error: profile.session_error || (profile.stale ? "账号状态尚未刷新，请检查 WAN 服务和浏览器登录" : "ModelScope 账号暂不可用"), windows: [] }
         if (typeof profile.balance !== "number" || !Number.isFinite(profile.balance)) return { user, error: profile.balance_error || "魔粒余额暂不可用", windows: [] }
-        return { user, plan: "ModelScope WAN", balance: `${profile.balance} 魔粒`,
+        return { user, plan: "ModelScope WAN",
           windows: [{ name: "可用魔粒", balance: profile.balance, unit: "魔粒", display: `${profile.balance} 魔粒` }] }
       },
     },
     provider: { id: PROVIDER, models: async () => ({}) },
     tool: {
+      wan_get_models: tool({ description: "List WAN adapter models, first/last-frame support and validated input limits. Local download success is separate from visual quality acceptance.", args: {},
+        execute: (_args, ctx = {}) => request(options, "/v1/models", { signal: ctx.abort }) }),
+      wan_diagnose: tool({ description: "Check plugin/service protocol compatibility, live workers, account sessions, input roots and affected jobs after installation or upgrade.", args: {},
+        async execute(_args, ctx = {}) {
+          const health = await request(options, "/health", { signal: ctx.abort })
+          if (health.protocol_version !== PROTOCOL_VERSION || health.service_version !== PLUGIN_VERSION) return { plugin_version: PLUGIN_VERSION, ...health,
+            compatible: false, action: "Update/restart the WAN service and reload the Magpie plugin." }
+          return { plugin_version: PLUGIN_VERSION, ...await request(options, "/v1/diagnostics", { signal: ctx.abort }), compatible: true }
+        } }),
+      wan_control_job: tool({ description: "Pause/resume/cancel local unsubmitted queued jobs, or explicitly reassign them to a connected account. Cancel does not cancel a provider generation or just stop watching. Submitted/ambiguous jobs are rejected.",
+        args: { job_id: tool.schema.string().min(1), action: tool.schema.enum(["pause", "resume", "cancel", "reassign"]), account: tool.schema.string().optional() },
+        execute: ({ job_id, ...body }, ctx = {}) => request(options, `/v1/videos/${encodeURIComponent(job_id)}/control`,
+          { method: "POST", body: JSON.stringify(body), signal: ctx.abort }) }),
+      wan_reconcile_job: tool({ description: "Resolve unknown_submission only after checking the original ModelScope account: link its existing provider task ID, OR explicitly confirm no task was created before requeuing. Never guess or automatically retry ambiguous submissions.",
+        args: { job_id: tool.schema.string().min(1), provider_task_id: tool.schema.string().min(1).optional(), confirm_no_task: tool.schema.boolean().optional() },
+        execute: ({ job_id, ...body }, ctx = {}) => request(options, `/v1/videos/${encodeURIComponent(job_id)}/resolve`,
+          { method: "POST", body: JSON.stringify(body), signal: ctx.abort }) }),
       wan_generate_flf2v: submitTool(options, true, "wan2.1-flf2v-14b", watch),
       wan_generate_i2v: submitTool(options, false, "wan2.2-i2v-a14b", watch),
       wan_get_video_status: statusTool(options),
@@ -411,7 +443,9 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
       wan_get_config: tool({ description: "Show allowed input directories and each local ModelScope account's connection and magicube balance.", args: {},
         async execute(_args, ctx = {}) { const [media, accounts] = await Promise.all([
           request(options, "/v1/media/roots", { signal: ctx.abort }), request(options, "/v1/accounts", { signal: ctx.abort }),
-        ]); return { ...media, ...accounts, usage_unit: "魔粒" } } }),
+        ]); return { ...media, ...accounts, usage_unit: "魔粒",
+          routing: options.routing || "balanced", preferred_account: options.preferredAccount,
+          routing_modes: { preferred: "首选账号", balanced: "均衡负载：剩余魔粒最多优先，余额相同选队列最短" } } } }),
       wan_prepare_frames: tool({ description: "Validate frame paths before submitting; explicitly enable copying images outside allowed directories.",
         args: { first_frame: tool.schema.string().min(1), last_frame: tool.schema.string().optional(), copy_to_media_root: tool.schema.boolean().optional() },
         execute: (args, ctx = {}) => prepareFrames(args, options, ctx.abort) }),

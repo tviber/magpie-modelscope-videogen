@@ -1,0 +1,526 @@
+--- a/internal/provider/subscription_usage.go
++++ b/internal/provider/subscription_usage.go
+@@ -67,6 +67,8 @@
+ 	// usage cap, Amount of Limit and Used are what the wallet spent in the
+ 	// cap's period instead (wallet_spend.go, #5770), for the cap to hold.
+ 	Balance *float64 `json:"balance,omitempty"`
++	// BalanceTrend keeps actual wallet readings in Unit, with no inferred quota.
++	BalanceTrend *BalanceTrend `json:"balanceTrend,omitempty"`
+ 	// Spent is, on a wallet's window (Balance), how much of it magpie saw
+ 	// go since SpentSince, the first reading of the period a cap counts it
+ 	// over: the window's own until its reset, else the local day
+--- a/internal/provider/quotas.go
++++ b/internal/provider/quotas.go
+@@ -149,6 +149,8 @@
+ 	// Balance is how much is left in Unit, a prepaid wallet's reading
+ 	// (QuotaWindow.Balance, #3950): Used and Remaining are then no share.
+ 	Balance *float64 `json:"balance,omitempty"`
++	// BalanceTrend keeps actual wallet readings in Unit, with no inferred quota.
++	BalanceTrend *BalanceTrend `json:"balanceTrend,omitempty"`
+ 	// Spent is what magpie counted such a wallet spending since
+ 	// SpentSince, its period's first reading (QuotaWindow.Spent, #5770).
+ 	Spent      *float64   `json:"spent,omitempty"`
+@@ -209,7 +211,7 @@
+ 			// as the usage page shows them
+ 			for _, w := range PooledWindows(q.Windows) {
+ 				s := QuotaSpan{Unlimited: w.Unlimited, Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display, Text: w.Text, Lane: w.Lane,
+-					Amount: w.Amount, Limit: w.Limit, Unit: w.Unit, Pool: w.Pool, RunsOutAt: w.RunsOutAt, RunsOut: w.RunsOut, Balance: w.Balance,
++					Amount: w.Amount, Limit: w.Limit, Unit: w.Unit, Pool: w.Pool, RunsOutAt: w.RunsOutAt, RunsOut: w.RunsOut, Balance: w.Balance, BalanceTrend: w.BalanceTrend,
+ 					Spent: w.Spent, SpentSince: w.SpentSince, Holds: w.Holds, HoldsWhy: w.HoldsWhy}
+ 				if s.ResetsAt == nil && w.ResetSecs > 0 {
+ 					t := now.Add(time.Duration(w.ResetSecs) * time.Second)
+--- a/internal/provider/balance_history.go
++++ b/internal/provider/balance_history.go
+@@ -317,6 +317,7 @@
+ // alone.
+ func noteCardHistory(qs []SubscriptionQuota, now time.Time) {
+ 	noteQuotaHistory(qs, now)
++	noteWalletHistory(qs, now)
+ 	var idx []int
+ 	for i, q := range qs {
+ 		if q.Balance != "" && len(q.Windows) == 0 && len(q.BalanceParts) == 0 {
+--- a/internal/provider/quota_history.go
++++ b/internal/provider/quota_history.go
+@@ -229,7 +229,7 @@
+ // no share to draw, and neither has one set aside whose Used is 0 for
+ // want of a share said (noShare, #4825).
+ func pointOf(w QuotaWindow, at, now time.Time) (QuotaPoint, bool) {
+-	if w.Unlimited || w.Text || w.noShare || w.Family != "" || w.Name == "" || math.IsNaN(w.Used) {
++	if w.Unlimited || w.Text || w.noShare || w.Balance != nil || w.Family != "" || w.Name == "" || math.IsNaN(w.Used) {
+ 		return QuotaPoint{}, false
+ 	}
+ 	p := QuotaPoint{At: at.UTC().Truncate(time.Second), Left: math.Round(max(0, min(100, 100-w.Used))*100) / 100}
+--- a/internal/provider/quota_span_test.go
++++ b/internal/provider/quota_span_test.go
+@@ -88,7 +88,7 @@
+ 	// and what is carried is copied: a window with each set says each
+ 	at := time.Date(2026, 10, 30, 17, 0, 0, 0, time.UTC)
+ 	bal := 6291.0
+-	full := QuotaWindow{Balance: &bal, Unlimited: true, Name: "Credits", Used: 40, ResetsAt: &at, Display: "1 / 2", Text: true, Amount: 1, Limit: 2, Unit: "credits",
++	full := QuotaWindow{BalanceTrend: &BalanceTrend{Points: []BalancePoint{{At: at, Amount: bal}}}, Balance: &bal, Unlimited: true, Name: "Credits", Used: 40, ResetsAt: &at, Display: "1 / 2", Text: true, Amount: 1, Limit: 2, Unit: "credits",
+ 		RunsOutAt: &at, RunsOut: 3, Pool: "P", Lane: "images", Holds: &WindowHolds{}, HoldsWhy: "x", Spent: &bal, SpentSince: &at}
+ 	got := quotaReport([]SubscriptionQuota{{Provider: "p", Windows: []QuotaWindow{full}}}, nil, nil, at)
+ 	b, _ := json.Marshal(got[0].Windows[0])
+--- /dev/null
++++ b/internal/provider/wallet_history.go
+@@ -0,0 +1,65 @@
++package provider
++
++import (
++	"crypto/sha256"
++	"encoding/json"
++	"fmt"
++	"math"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// noteWalletHistory records each prepaid window separately. The identity
++// includes the window and its unit so a renamed wallet or changed currency
++// never inherits another series. ReadAt and AsOf keep cached reads from
++// becoming fresh samples. Storage, retention and fitting match key balances.
++func noteWalletHistory(qs []SubscriptionQuota, now time.Time) {
++	type position struct{ card, window int }
++	var cards []SubscriptionQuota
++	var positions []position
++	for i, q := range qs {
++		if q.Provider == "" || q.Estimate != nil {
++			continue
++		}
++		for j, w := range q.Windows {
++			if w.Balance == nil || w.Text || math.IsNaN(*w.Balance) || math.IsInf(*w.Balance, 0) {
++				continue
++			}
++			identity, _ := json.Marshal([]string{strings.ToLower(q.User), w.Name, w.Unit, w.Family, w.Pool, w.Model})
++			c := q
++			c.Provider = "@wallet:" + q.Provider
++			c.User = fmt.Sprintf("%x", sha256.Sum256(identity))
++			c.Balance = strconv.FormatFloat(*w.Balance, 'f', -1, 64)
++			c.BalanceParts = nil
++			c.BalanceTrend = nil
++			cards = append(cards, c)
++			positions = append(positions, position{i, j})
++		}
++	}
++	if len(cards) == 0 {
++		return
++	}
++	noteBalanceHistory(cards, now)
++	for i, at := range positions {
++		tr := cards[i].BalanceTrend
++		if tr == nil {
++			// A first real reading is a point, not an invented flat past.
++			pts := readWalletPoints(cards[i], now)
++			if len(pts) == 1 {
++				tr = &BalanceTrend{Points: pts}
++			}
++		}
++		qs[at.card].Windows[at.window].BalanceTrend = tr
++	}
++}
++
++func readWalletPoints(q SubscriptionQuota, now time.Time) []BalancePoint {
++	balanceHistMu.Lock()
++	defer balanceHistMu.Unlock()
++	pts := readBalanceHist()[quotaHistKey(q.Provider, q.User)]
++	if len(pts) == 1 && !pts[0].At.Before(now.Add(-balanceShowSpan)) {
++		return pts
++	}
++	return nil
++}
+--- /dev/null
++++ b/internal/provider/wallet_history_test.go
+@@ -0,0 +1,50 @@
++package provider
++
++import (
++	"github.com/yetone/magpie/internal/testenv"
++	"testing"
++	"time"
++)
++
++func TestWalletHistoryAccountIsolationAndReport(t *testing.T) {
++	testenv.SetHome(t, t.TempDir())
++	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
++	start := time.Date(2026, 11, 12, 12, 0, 0, 0, time.UTC)
++	card := func(user, unit string, n float64) SubscriptionQuota {
++		return SubscriptionQuota{Provider: "wan", User: user, Windows: []QuotaWindow{{Name: "可用魔粒", Unit: unit, Balance: &n}}}
++	}
++	noteCardHistory([]SubscriptionQuota{card("a", "魔粒", 300), card("b", "魔粒", 200)}, start)
++	qs := []SubscriptionQuota{card("a", "魔粒", 290), card("b", "魔粒", 180), card("a", "USD", 999)}
++	noteCardHistory(qs, start.Add(10*time.Minute))
++	for i, want := range []float64{290, 180} {
++		tr := qs[i].Windows[0].BalanceTrend
++		if tr == nil || len(tr.Points) != 2 || tr.Points[1].Amount != want {
++			t.Fatalf("account %d lost its wallet readings: %+v", i, tr)
++		}
++	}
++	if tr := qs[2].Windows[0].BalanceTrend; tr == nil || len(tr.Points) != 1 || tr.Points[0].Amount != 999 {
++		t.Fatal("changed units inherited a different wallet")
++	}
++	report := quotaReport(qs, nil, nil, start.Add(10*time.Minute))
++	if report[0].Windows[0].BalanceTrend == nil {
++		t.Fatal("usage API dropped wallet history")
++	}
++	stale := card("a", "魔粒", 1)
++	stale.AsOf = &start
++	noteCardHistory([]SubscriptionQuota{stale}, start.Add(20*time.Minute))
++	bad := card("a", "魔粒", 0)
++	bad.Error = "offline"
++	noteCardHistory([]SubscriptionQuota{bad}, start.Add(30*time.Minute))
++	fresh := []SubscriptionQuota{card("a", "魔粒", 280)}
++	noteCardHistory(fresh, start.Add(40*time.Minute))
++	tr := fresh[0].Windows[0].BalanceTrend
++	if len(tr.Points) != 3 || tr.Points[1].Amount != 290 {
++		t.Fatalf("failed or stale read became history: %+v", tr)
++	}
++	if _, ok := pointOf(fresh[0].Windows[0], start, start); ok {
++		t.Fatal("wallet was recorded as a fictitious percentage")
++	}
++	if fresh[0].Balance != "" {
++		t.Fatal("wallet chart introduced duplicate top-level balance")
++	}
++}
+--- a/internal/gui/assets/app.js
++++ b/internal/gui/assets/app.js
+@@ -14609,6 +14609,7 @@
+ function quotaAllJS() {
+   return (quotaAllJS.p ||= import("./quotaall.js").then(() => renderQuotas(), () => {}));
+ }
++const walletCurvesOf = (...a) => window.walletCurves ? walletCurves(...a) : (quotaAllJS(), document.createDocumentFragment());
+ const quotaAllOf = (...a) => window.quotaAll ? quotaAll(...a) : void quotaAllJS();
+ // quotatable.js: the allowances as a table, loaded once chosen. Cards or
+ // table is the reader's own pick on this computer, cards until then.
+@@ -16077,6 +16078,7 @@
+     const all = !keys && several && quotaAllOf(subs);
+     if (all) card.append(all);
+     const shut = all && quotaAllFolded(first.provider); // quotaall.js
++    if (shut) card.append(walletCurvesOf(subs, true));
+     // many accounts (Linx on X: twenty-odd): the same, each a row
+     const accts = !shut && !keys && several && subs.length > ACCTS_FOLD;
+     const folded = shut ? new Set(subs) : keys ? keysFolded(subs) : accts ? acctsFolded(subs) : new Set();
+@@ -16131,6 +16133,7 @@
+       // the balance over time, and when it runs out at that pace
+       const spend = !brief && !history && !sub.error && balanceCurve(sub);
+       if (spend) card.append(spend);
++      if (!brief && !history && !sub.error) card.append(walletCurvesOf([sub]));
+       // when the windows were read: "Updated 3 min ago", or the time of
+       // ones standing in for a reading that failed just now (#802; a
+       // balance alone says it in its row)
+@@ -16597,7 +16600,7 @@
+   if (!h) return [];
+   const out = [];
+   for (const w of sub.windows || []) {
+-    if (w.unlimited || w.family) continue;
++    if (w.unlimited || w.family || quotaNoShare(w)) continue;
+     // a pool's window is kept under the pool's name and its own
+     const name = w.pool ? w.pool + " · " + w.name : w.name;
+     const l = h.lines.find((x) => x.name === name);
+@@ -16948,65 +16951,7 @@
+   const m = (sub.balance || "").match(/^(.*?)-?\d[\d,]*(?:\.\d+)?(.*)$/);
+   return m ? m[1] + n + m[2] : n;
+ }
+-// balanceCurve: a key's balance over time (TJHHHH on Discord), its fit
+-// since the last top-up dashed on to zero when near, and when it runs out
+-// in the head. The allowances' range; none while off or with one reading.
+-function balanceCurve(sub) {
+-  if (quotaRange === "off") return null;
+-  const tr = sub.balanceTrend;
+-  if (!tr?.points?.length || tr.points.length < 2) return null;
+-  const pts = tr.points.map((p) => ({ at: Date.parse(p.at), v: p.amount }));
+-  const box = el("div", "quota-curve balance-curve");
+-  const head = el("div", "qc-head");
+-  const out = tr.runsOut ? Date.parse(tr.runsOut) : null;
+-  const pace = el("span", "qc-range");
+-  head.append(el("span", "", t("Balance over time")), pace);
+-  box.title = t("Solid: the balance as magpie read it. Dashed: a straight line fitted through it since the last top-up, carried on to where it runs out. Click to enlarge.");
+-  const W = 300, H = 60;
+-  const g = sv("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", class: "qc-plot", role: "img" });
+-  curveZoom(box, g);
+-  const axis = el("div", "qc-axis");
+-  const legend = el("div", "qc-legend");
+-  const k = el("span", "qc-key");
+-  const sw = el("i");
+-  sw.style.background = "var(--c1)";
+-  const last = pts[pts.length - 1];
+-  k.append(sw, el("span", "", t("Balance")), el("b", "", balanceAmount(sub, last.v)));
+-  k.title = [t("Latest readings:"), ...pts.slice(-8).reverse().map((p) => balanceAmount(sub, p.v) + " · " + quotaTimeText(p.at, Date.now()))].join("\n");
+-  legend.append(k);
+-  if (tr.perDay > 0) legend.append(el("span", "qc-key bc-pace", t("about {amount} a day", { amount: balanceAmount(sub, tr.perDay) })));
+-  box.draw = () => {
+-    const now = Date.now();
+-    let x0 = quotaRange === "2d" ? now - 48 * 3600e3 : pts[0].at, x1 = now;
+-    if (!(x0 < now)) x0 = now - 3600e3;
+-    // the dashes reach zero when it is no further off than what is shown
+-    if (out && out > now && out - now <= now - x0) x1 = out;
+-    const top = Math.max(...pts.filter((p) => p.at >= x0).map((p) => p.v), last.v, tr.fitStart || 0) * 1.08 || 1;
+-    const X = (at) => ((at - x0) / (x1 - x0)) * W, Y = (v) => H - (Math.max(0, Math.min(top, v)) / top) * H;
+-    g.replaceChildren();
+-    for (const f of [0, 0.5, 1]) g.append(sv("line", { x1: 0, x2: W, y1: H - f * H, y2: H - f * H, class: "qc-grid" }));
+-    if (tr.fitFrom) {
+-      const from = Date.parse(tr.fitFrom), slope = (tr.fitNow - tr.fitStart) / (now - from || 1);
+-      const end = out && x1 === out ? out : now;
+-      g.append(sv("line", { x1: X(from), y1: Y(tr.fitStart), x2: X(end), y2: Y(tr.fitStart + slope * (end - from)), class: "qc-even bc-fit" }, { stroke: "var(--c1)" }));
+-    }
+-    let d = "";
+-    for (let i = 0; i < pts.length; i++) {
+-      const p = pts[i], next = pts[i + 1];
+-      if (p.at < x0 && next && next.at < x0) continue;
+-      d += (d ? "L" : "M") + X(p.at).toFixed(1) + " " + Y(p.v).toFixed(1);
+-    }
+-    if (d) g.append(sv("path", { d, class: "qc-line" }, { stroke: "var(--c1)" }));
+-    if (x1 > now) g.append(sv("line", { x1: X(now), x2: X(now), y1: 0, y2: H, class: "qc-now" }));
+-    pace.textContent = out ? t("Runs out {in} at this pace", { in: untilText(Math.max(out, now + 60e3)) }) : "";
+-    pace.title = out ? new Date(out).toLocaleString(intlLang()) : "";
+-    g.setAttribute("aria-label", t("Balance over time") + (out ? " · " + pace.textContent : ""));
+-    axis.replaceChildren(el("span", "", quotaTimeText(x0, now)), el("span", "", quotaTimeText(x1, now)));
+-  };
+-  box.append(head, g, axis, legend);
+-  box.draw();
+-  return box;
+-}
++const balanceCurve = (sub) => window.drawBalanceCurve ? drawBalanceCurve(sub) : void quotaAllJS();
+ function setQuotaRange(id) {
+   if (id === quotaRange) return;
+   quotaRange = id;
+--- a/internal/gui/assets/quotaall.js
++++ b/internal/gui/assets/quotaall.js
+@@ -140,3 +140,119 @@
+ window.quotaAllFolded = quotaAllFolded;
+ window.setQuotaAllFolded = setQuotaAllFolded;
+ window.quotaAll = quotaAll;
++
++// Wallets share neither a quota nor a reset. Sum their observed balances
++// only over their common history, carrying the last reading of each forward.
++// Failed/stale accounts make a full total unknown rather than zero.
++function walletTotals(subs) {
++  if (subs.some((q) => q.error || q.asOf)) return [];
++  const groups = new Map();
++  for (const q of subs) {
++    const seen = new Set();
++    for (const w of q.windows || []) {
++      if (w.balance == null || w.text) continue;
++      const key = JSON.stringify([w.name, w.unit || "", w.pool || "", w.family || ""]);
++      if (seen.has(key)) return [];
++      seen.add(key);
++      if (!groups.has(key)) groups.set(key, []);
++      groups.get(key).push(w);
++    }
++  }
++  const out = [];
++  for (const ws of groups.values()) {
++    if (ws.length !== subs.length) continue;
++    const lines = ws.map((w) => (w.balanceTrend?.points || []).map((p) => ({ at: Date.parse(p.at), amount: p.amount }))
++      .filter((p) => Number.isFinite(p.at) && Number.isFinite(p.amount)).sort((a, b) => a.at - b.at));
++    if (lines.some((ps) => !ps.length)) continue;
++    const start = Math.max(...lines.map((ps) => ps[0].at));
++    const times = [...new Set(lines.flatMap((ps) => ps.map((p) => p.at)))].filter((at) => at >= start).sort((a, b) => a - b);
++    const indices = lines.map(() => 0);
++    const points = times.map((at) => {
++      let amount = 0;
++      lines.forEach((ps, i) => { while (indices[i] + 1 < ps.length && ps[indices[i] + 1].at <= at) indices[i]++; amount += ps[indices[i]].amount; });
++      return { at: new Date(at).toISOString(), amount };
++    });
++    out.push({ ...ws[0], balance: ws.reduce((n, w) => n + w.balance, 0), balanceTrend: { points } });
++  }
++  return out;
++}
++function walletCurves(subs, total = false) {
++  const fragment = document.createDocumentFragment();
++  const ws = total ? walletTotals(subs) : (subs[0].windows || []);
++  for (const w of ws) {
++    if (w.balance == null || w.text) continue;
++    const curve = balanceCurve({ balance: `${w.balance} ${w.unit || ""}`.trim(), balanceTrend: w.balanceTrend, wallet: true });
++    if (!curve) continue;
++    curve.classList.add("wallet-curve");
++    curve.dataset.wallet = w.name;
++    if (total) curve.dataset.total = "true";
++    fragment.append(curve);
++  }
++  return fragment;
++}
++window.walletCurves = walletCurves;
++
++window.walletTotals = walletTotals;
++
++// balanceCurve: a key's balance over time (TJHHHH on Discord), its fit
++// since the last top-up dashed on to zero when near, and when it runs out
++// in the head. The allowances' range; none while off or with one reading.
++function drawBalanceCurve(sub) {
++  if (quotaRange === "off") return null;
++  const tr = sub.balanceTrend;
++  if (!tr?.points?.length || (!sub.wallet && tr.points.length < 2)) return null;
++  const pts = tr.points.map((p) => ({ at: Date.parse(p.at), v: p.amount }));
++  const box = el("div", "quota-curve balance-curve");
++  const head = el("div", "qc-head");
++  const out = tr.runsOut ? Date.parse(tr.runsOut) : null;
++  const pace = el("span", "qc-range");
++  head.append(el("span", "", t("Balance over time")), pace);
++  box.title = t("Solid: the balance as magpie read it. Dashed: a straight line fitted through it since the last top-up, carried on to where it runs out. Click to enlarge.");
++  const W = 300, H = 60;
++  const g = sv("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", class: "qc-plot", role: "img" });
++  curveZoom(box, g);
++  const axis = el("div", "qc-axis");
++  const legend = el("div", "qc-legend");
++  const k = el("span", "qc-key");
++  const sw = el("i");
++  sw.style.background = "var(--c1)";
++  const last = pts[pts.length - 1];
++  k.append(sw, el("span", "", t("Balance")), el("b", "", balanceAmount(sub, last.v)));
++  k.title = [t("Latest readings:"), ...pts.slice(-8).reverse().map((p) => balanceAmount(sub, p.v) + " · " + quotaTimeText(p.at, Date.now()))].join("\n");
++  legend.append(k);
++  if (tr.perDay > 0) legend.append(el("span", "qc-key bc-pace", t("about {amount} a day", { amount: balanceAmount(sub, tr.perDay) })));
++  box.draw = () => {
++    const now = Date.now();
++    let x0 = quotaRange === "2d" ? now - 48 * 3600e3 : pts[0].at, x1 = now;
++    if (!(x0 < now)) x0 = now - 3600e3;
++    // the dashes reach zero when it is no further off than what is shown
++    if (out && out > now && out - now <= now - x0) x1 = out;
++    const top = Math.max(...pts.filter((p) => p.at >= x0).map((p) => p.v), last.v, tr.fitStart || 0) * 1.08 || 1;
++    const X = (at) => ((at - x0) / (x1 - x0)) * W, Y = (v) => H - (Math.max(0, Math.min(top, v)) / top) * H;
++    g.replaceChildren();
++    for (const f of [0, 0.5, 1]) g.append(sv("line", { x1: 0, x2: W, y1: H - f * H, y2: H - f * H, class: "qc-grid" }));
++    if (tr.fitFrom) {
++      const from = Date.parse(tr.fitFrom), slope = (tr.fitNow - tr.fitStart) / (now - from || 1);
++      const end = out && x1 === out ? out : now;
++      g.append(sv("line", { x1: X(from), y1: Y(tr.fitStart), x2: X(end), y2: Y(tr.fitStart + slope * (end - from)), class: "qc-even bc-fit" }, { stroke: "var(--c1)" }));
++    }
++    let d = "";
++    for (let i = 0; i < pts.length; i++) {
++      const p = pts[i], next = pts[i + 1];
++      if (p.at < x0 && next && next.at < x0) continue;
++      d += (d ? "L" : "M") + X(p.at).toFixed(1) + " " + Y(p.v).toFixed(1);
++    }
++    if (d) g.append(sv("path", { d, class: "qc-line" }, { stroke: "var(--c1)" }));
++    if (pts.length === 1) g.append(sv("circle", { cx: X(last.at), cy: Y(last.v), r: 1.5 }, { fill: "var(--c1)" }));
++    if (x1 > now) g.append(sv("line", { x1: X(now), x2: X(now), y1: 0, y2: H, class: "qc-now" }));
++    pace.textContent = out ? t("Runs out {in} at this pace", { in: untilText(Math.max(out, now + 60e3)) }) : "";
++    pace.title = out ? new Date(out).toLocaleString(intlLang()) : "";
++    g.setAttribute("aria-label", t("Balance over time") + (out ? " · " + pace.textContent : ""));
++    axis.replaceChildren(el("span", "", quotaTimeText(x0, now)), el("span", "", quotaTimeText(x1, now)));
++  };
++  box.append(head, g, axis, legend);
++  box.draw();
++  return box;
++}
++
++window.drawBalanceCurve = drawBalanceCurve;
+--- /dev/null
++++ b/internal/gui/tests/wallet-trend.test.cjs
+@@ -0,0 +1,80 @@
++const assert = require('node:assert/strict');
++const fs = require('node:fs/promises');
++const path = require('node:path');
++const { test } = require('node:test');
++const { chromium, webkit } = require('playwright');
++const assets = path.resolve(process.env.MAGPIE_ASSETS || path.join(__dirname, '../assets'));
++function fixtures() {
++  const now = Date.now();
++  const ago = (h) => new Date(now-h*3600e3).toISOString();
++  return [300, 174, 244, 350].map((balance, i) => ({ provider:'modelscope-wan', name:'ModelScope WAN', plan:'ModelScope WAN', user:`account-${i+1}`, windows:[{name:'可用魔粒', balance, unit:'魔粒', balanceTrend:{points:[{at:ago(12-i),amount:balance+50},{at:ago(6),amount:balance+20},{at:ago(1),amount:balance}]}}] }));
++}
++function serve(lang, data) {
++ const ago=(h)=>new Date(Date.now()-h*3600e3).toISOString();
++ return async (route) => {
++  const url = new URL(route.request().url()), json=(data)=>route.fulfill({json:data});
++  if(url.pathname==='/boot.js') return route.fulfill({contentType:'text/javascript',body:`window.bootPrefs={lang:${JSON.stringify(lang)},theme:'light',web:true};`});
++  if(url.pathname==='/wails/runtime.js') return route.fulfill({contentType:'text/javascript',body:'export const Window={};'});
++  if(url.pathname==='/api/state')return json({agents:[],profiles:[],settings:{lang,theme:'light'}});
++  if(url.pathname==='/api/providers')return json({providers:[],presets:[],excluded:[],gateway:{running:true,window:true}});
++  if(url.pathname==='/api/usage/quotas')return json(data);
++  if(url.pathname==='/api/usage/quotas/history')return json([{provider:'modelscope-wan',user:'account-1',lines:[{name:'可用魔粒',points:[{at:ago(24),left:100},{at:ago(12),left:100}]}]}]);
++  if(url.pathname==='/api/groups')return json({groups:[],models:[]});
++  if(url.pathname==='/api/plugins')return json({plugins:[]});
++  if(url.pathname.startsWith('/api/'))return json({});
++  const file=path.join(assets,url.pathname==='/'?'index.html':url.pathname);
++  try {return route.fulfill({body:await fs.readFile(file),contentType:{'.html':'text/html','.js':'text/javascript','.css':'text/css','.svg':'image/svg+xml','.png':'image/png'}[path.extname(file)]});}catch{return route.fulfill({status:404,body:''});}
++ };
++}
++for (const engine of (process.env.BROWSER?[process.env.BROWSER]:['chromium','webkit'])) {
++ test(`${engine}: wallet account curves and folded total`,async(t)=>{
++  const browser=await(engine==='webkit'?webkit.launch():chromium.launch({channel:'chromium'}));
++  t.after(()=>browser.close());
++  for(const lang of ['zh','en','zh-TW','ja','de']) for(const width of [900,390]) {
++   const page=await browser.newPage({viewport:{width,height:950},reducedMotion:'reduce'});
++   page.setDefaultTimeout(10000);page.setDefaultNavigationTimeout(60000);
++   const errors=[];page.on('pageerror',e=>errors.push(e.message));
++   await page.addInitScript(()=>localStorage.setItem('magpie.usageOpen',JSON.stringify(['modelscope-wan'])));
++   await page.route('**/*',serve(lang,fixtures()));
++   await page.goto('http://magpie.test/?view=usage');
++   const card=page.locator('.subscription-card',{hasText:'ModelScope WAN'});
++   await card.locator('.wallet-curve').nth(3).waitFor();
++   assert.equal(await card.locator('.wallet-curve').count(),4);
++   assert.equal(await card.locator('.quota-balance').count(),0);
++   assert.equal(await card.locator('.wallet-curve .qc-grid').count(),12);
++   assert.equal(await card.locator('.quota-curve:not(.wallet-curve)').count(),0,'old percentage history must not draw a fake 100% wallet curve');
++   if(lang==='zh' && width===900 && process.env.ARTIFACT_DIR)await card.screenshot({path:path.join(process.env.ARTIFACT_DIR,'expanded.png')});
++   await card.locator('.quota-all-fold').click();
++   await card.locator('.wallet-curve[data-total]').waitFor();
++   assert.equal(await card.locator('.wallet-curve').count(),1);
++   assert.equal(await card.locator('.subscription-account').count(),0);
++   assert.match(await card.locator('.qc-legend').innerText(),/1[,.]068\s*魔粒/);
++   const totals=await page.evaluate(()=>walletTotals(quotas.filter(q=>q.provider==='modelscope-wan')));
++   assert.equal(totals[0].balanceTrend.points[0].amount,1268);
++   assert.equal(totals[0].balanceTrend.points.at(-1).amount,1068);
++   assert.equal(totals[0].balanceTrend.points.length,3);
++   await card.locator('.qc-plot').click();
++   assert.equal(await card.locator('.wallet-curve.big').count(),1);
++   assert.equal(await card.locator('.subscription-account').count(),0,'zoom must not unfold accounts');
++   const overflow=await page.evaluate(()=>document.documentElement.scrollWidth-document.documentElement.clientWidth);
++   assert.ok(overflow<=0,`${lang} ${width}: overflow ${overflow}`);
++   if(lang==='zh' && process.env.ARTIFACT_DIR)await card.screenshot({path:path.join(process.env.ARTIFACT_DIR,`folded-${width}.png`)});
++   assert.deepEqual(errors,[],`${lang} ${width}`);
++   await card.locator('.quota-all-fold').click();
++   assert.equal(await card.locator('.wallet-curve').count(),4);
++   await page.close();
++  }
++ });
++ test(`${engine}: unavailable and differently named wallets never make a false total`,async(t)=>{
++  const browser=await(engine==='webkit'?webkit.launch():chromium.launch({channel:'chromium'}));t.after(()=>browser.close());
++  const page=await browser.newPage();page.setDefaultTimeout(10000);page.setDefaultNavigationTimeout(60000);
++  await page.route('**/*',serve('en',fixtures()));await page.goto('http://magpie.test/?view=usage');await page.locator('.quota-all-fold').waitFor();
++  await page.waitForFunction(()=>typeof window.walletCurves==='function');
++  const result=await page.evaluate(()=>{
++   const qs=quotas.filter(q=>q.provider==='modelscope-wan');
++   const calc=(change)=>{const copy=structuredClone(qs);change(copy);return walletTotals(copy).length;};
++   return {missing:calc(q=>delete q[1].windows[0].balanceTrend),failed:calc(q=>q[1].error='offline'),stale:calc(q=>q[1].asOf=new Date().toISOString()),unit:calc(q=>q[1].windows[0].unit='USD'),name:calc(q=>q[1].windows[0].name='other')};
++  });assert.deepEqual(result,{missing:0,failed:0,stale:0,unit:0,name:0});
++  const first=await page.evaluate(()=>{const q=structuredClone(quotas[0]);q.windows[0].balanceTrend.points=[q.windows[0].balanceTrend.points.at(-1)];return walletCurves([q]).querySelectorAll('.qc-plot circle').length;});assert.equal(first,1,'first real reading is a point without fake past');await page.close();
++ });
++}
+--- a/docs/subsystems/providers-accounts.md
++++ b/docs/subsystems/providers-accounts.md
+@@ -506,3 +506,13 @@
+ Vertex AI's tests send Vertex AI, Google's token endpoint and IAM Credentials
+ to a server of their own (`VertexForTest`). Check a change
+ against real accounts in a sandbox HOME, as [Code standards](../code-standards.md#acceptance-criteria) describes.
++
++### Wallet balance history
++
++`noteCardHistory` also calls `noteWalletHistory` to persist actual
++`QuotaWindow.Balance` readings in `balance-history.json`, under a separate
++wallet namespace with hashed account/window/unit identity. Failed, estimated
++and stale readings do not add samples; `ReadAt` prevents cached reads from
++advancing time. `QuotaWindow.BalanceTrend` and `QuotaSpan.BalanceTrend` carry
++the series to the GUI and quota report. A first reading remains one point.
++Retention and downsampling match key balances.
+--- a/docs/subsystems/gui-shell.md
++++ b/docs/subsystems/gui-shell.md
+@@ -1268,3 +1268,16 @@
+ saves, narrow layouts and all five languages in Chromium and WebKit.
+ 
+ - A gateway port another program holds names that program (pluoki on X). `gateway.NoteHeld` reads the holder with `proc.PortHolder` (lsof on the Mac, /proc on Linux, Get-NetTCPConnection on Windows) and, when the daemon is root's and unreadable, falls back to `tailscale serve status --json` for the port. Tailscale's line carries `tailscale serve --https=<other> http://127.0.0.1:<port>`. The sentence (`PortHeld.Sentence`) goes to the `magpie serve` standby line and bind error, the app's log, `gatewayHeld` in `/api/state` (Gateway page) and Start's `taken` answer. A holder that can't be read says nothing, and the old wording stands. Nothing is killed or touched. See `TestWhoHolds`, `TestListenErrorNamesTheHolder`, `TestPortHolderNamesTheProgram` and `gateway-port-holder.test.cjs`.
++
++### Prepaid wallet curves
++
++The Usage page draws `windows[].balanceTrend` using the same native balance
++chart as key balances, loaded lazily from `quotaall.js`. No total quota, share
++or renewal is inferred. Expanded accounts show their own wallet readings.
++Folding a provider shows a total for identically named wallets in the same
++unit only when all accounts have readable histories. Summation starts at
++the latest first sample and carries each account's last reading forward at
++the union of sample times; failed/stale/missing accounts never become zero.
++The combined curve has no inferred spending forecast. A first reading is
++a point; later real readings form the line. `wallet-trend.test.cjs` checks
++folding, zoom, units, unavailable histories and narrow layouts.

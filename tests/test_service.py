@@ -131,7 +131,7 @@ def test_public_job_reports_project_request_actual_and_phases(tmp_path):
     job, _ = service.submit({"prompt": "Camera move", "first_frame": str(frame), "seconds": 8,
                              "size": "1280x720", "project": "MV one"})
     queued = service.public_job(job)
-    assert queued["phase"] == "Waiting for an account worker"
+    assert queued["execution_phase"] == "Waiting for an account worker"
     assert queued["requested"] == {"seconds": 8, "size": "1280x720", "width": 1280, "height": 720, "fps": None}
     assert queued["project"] == "MV one"
     assert queued["prompt"] == "Camera move"
@@ -217,7 +217,7 @@ def test_launch_browser_account_persists_new_cdp_profile_and_starts_worker(tmp_p
     browser.write_bytes(b"fixture")
     launches = []
     monkeypatch.setattr(wan_service, "_browser_executable", lambda: browser)
-    monkeypatch.setattr(wan_service, "_free_cdp_port", lambda: 19456)
+    monkeypatch.setattr(wan_service, "_free_cdp_port", lambda **kwargs: 19456)
     monkeypatch.setattr(wan_service.subprocess, "Popen", lambda command, **kwargs: launches.append((command, kwargs)))
     service = make_service(tmp_path / "first", {"account-1": "http://127.0.0.1:9223"})
     workers = []
@@ -468,7 +468,7 @@ def test_pending_login_is_not_scheduled_or_persisted_and_cancel_closes_browser(t
     process = Mock()
     process.poll.return_value = None
     monkeypatch.setattr(module, '_browser_executable', lambda: browser)
-    monkeypatch.setattr(module, '_free_cdp_port', lambda: 19457)
+    monkeypatch.setattr(module, '_free_cdp_port', lambda **kwargs: 19457)
     launch = Mock(return_value=process)
     monkeypatch.setattr(module.subprocess, 'Popen', launch)
     account = service.launch_browser_account(pending=True)['id']
@@ -487,6 +487,75 @@ def test_pending_login_is_not_scheduled_or_persisted_and_cancel_closes_browser(t
     restored.stop()
 
 
+def test_managed_account_avoids_configured_and_existing_browser_ports(tmp_path, monkeypatch):
+    import magpie_wan.service as module
+    browser = tmp_path / 'chrome'
+    browser.touch()
+    monkeypatch.setattr(module, '_browser_executable', lambda: browser)
+    allocated = []
+
+    def allocate_port(*, excluded=()):
+        excluded = set(excluded)
+        allocated.append(excluded)
+        return next(port for port in (19457, 19458, 19459) if port not in excluded)
+
+    monkeypatch.setattr(module, '_free_cdp_port', allocate_port)
+    monkeypatch.setattr(module.subprocess, 'Popen', lambda *_args, **_kwargs: None)
+    service = make_service(tmp_path, {
+        'account-1': 'http://127.0.0.1:19457',
+        'account-2': 'http://127.0.0.1:19458',
+    })
+    service.store.data_dir.joinpath('browser-profiles', 'account-3').mkdir(parents=True)
+    service._ensure_managed_browser('account-3')
+    assert allocated == [{19457, 19458}]
+    assert service.account_urls['account-3'] == 'http://127.0.0.1:19459'
+    service.stop()
+
+
+def test_saved_managed_account_is_reassigned_when_port_became_configured(tmp_path, monkeypatch):
+    import json
+    import magpie_wan.service as module
+    service = make_service(tmp_path, {'account-1': 'http://127.0.0.1:9223'})
+    service.store.data_dir.joinpath('browser-profiles', 'account-3').mkdir(parents=True)
+    service.store.data_dir.joinpath('browser-accounts.json').write_text(
+        json.dumps({'account-3': 'http://127.0.0.1:9223'}), encoding='utf-8')
+    service.stop()
+
+    monkeypatch.setattr(module, '_free_cdp_port', lambda **kwargs: 19459)
+    restored = make_service(tmp_path, {'account-1': 'http://127.0.0.1:9223'})
+    assert restored.account_urls['account-1'] == 'http://127.0.0.1:9223'
+    assert restored.account_urls['account-3'] == 'http://127.0.0.1:19459'
+    restored.stop()
+
+
+def test_configured_account_with_private_profile_is_restarted_as_managed(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    import magpie_wan.service as module
+    browser = tmp_path / 'chrome'
+    browser.touch()
+    profile = tmp_path / 'wan-service' / 'browser-profiles' / 'account-1'
+    profile.mkdir(parents=True)
+    process = Mock()
+    process.poll.return_value = None
+    monkeypatch.setattr(module, '_browser_executable', lambda: browser)
+    monkeypatch.setattr(module, '_free_cdp_port', lambda **_kwargs: 19460)
+    launch = Mock(return_value=process)
+    monkeypatch.setattr(module.subprocess, 'Popen', launch)
+    service = make_service(tmp_path, {'account-1': 'http://127.0.0.1:9223'})
+    monkeypatch.setattr(service, '_start_account_worker', lambda _account: None)
+    assert service._startup_accounts == set()
+    service.start()
+    assert service.account_urls['account-1'] == 'http://127.0.0.1:19460'
+    assert f'--user-data-dir={profile}' in launch.call_args.args[0]
+    service.stop()
+    restored = make_service(tmp_path, {'account-1': 'http://127.0.0.1:9223'})
+    monkeypatch.setattr(restored, '_start_account_worker', lambda _account: None)
+    restored.start()
+    assert restored.account_urls['account-1'] == 'http://127.0.0.1:19460'
+    assert restored._startup_accounts == set()
+    restored.stop()
+
+
 def test_managed_restart_reuses_profile_and_stops_owned_browser(tmp_path, monkeypatch):
     from unittest.mock import Mock
     import magpie_wan.service as module
@@ -494,7 +563,7 @@ def test_managed_restart_reuses_profile_and_stops_owned_browser(tmp_path, monkey
     browser.touch()
     monkeypatch.setattr(module, '_browser_executable', lambda: browser)
     ports = iter([19457, 19458])
-    monkeypatch.setattr(module, '_free_cdp_port', lambda: next(ports))
+    monkeypatch.setattr(module, '_free_cdp_port', lambda **kwargs: next(ports))
     processes = [Mock(), Mock()]
     for process in processes:
         process.poll.return_value = None
@@ -524,3 +593,220 @@ def test_identity_lookup_preserves_unique_binding_and_job_owner(tmp_path):
     with pytest.raises(ServiceError, match='already bound'):
         service.store.verify_identity('new', 'Id:123')
     service.stop()
+
+
+def test_balance_routing_filters_sessions_and_rechecks_latest_wallet(tmp_path):
+    import time
+    service = make_service(tmp_path, {a: f'http://localhost:{9300+i}' for i, a in enumerate('abcde')})
+    frame = make_frame(tmp_path / 'frame.png')
+    body = {'prompt': 'move', 'first_frame': str(frame), 'routing': 'balanced'}
+    for a, balance in zip('abcde', (10, 80, 500, 900, None)):
+        service.account_profiles[a].update(status='connected', balance=balance, checked_at=time.time())
+    service.account_profiles['c']['checked_at'] -= 121
+    service.account_profiles['d']['status'] = 'blocked'
+    first, _ = service.submit({**body, 'idempotency_key': 'balanced'})
+    assert first['account'] == 'b'
+    service.account_profiles['b']['balance'] = 5
+    assert service.submit(body)[0]['account'] == 'a'
+    assert service.submit({**body, 'idempotency_key': 'balanced'}) == (first, False)
+    with pytest.raises(ServiceError, match='different input'):
+        service.submit({**body, 'idempotency_key': 'balanced', 'routing': 'preferred'})
+    assert service.submit({**body, 'routing': 'preferred', 'preferred_account': 'b'})[0]['account'] == 'b'
+    with pytest.raises(ServiceError, match='首选账号'):
+        service.submit({**body, 'routing': 'preferred', 'preferred_account': 'c'})
+    assert service.submit({**body, 'account': 'c'})[0]['account'] == 'c'
+    for a in 'ab':
+        service.account_profiles[a]['balance'] = 0
+    before = set(service.store.jobs_dir.iterdir())
+    with pytest.raises(ServiceError, match='没有余额'):
+        service.submit(body)
+    assert set(service.store.jobs_dir.iterdir()) == before
+    service.stop()
+
+
+def test_concurrent_balance_ties_use_queue_and_idempotency(tmp_path):
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+    service = make_service(tmp_path, {'a': 'http://localhost:9301', 'b': 'http://localhost:9302'})
+    for p in service.account_profiles.values():
+        p.update(status='connected', balance=50, checked_at=time.time())
+    frame = make_frame(tmp_path / 'frame.png')
+    body = {'prompt': 'move', 'first_frame': str(frame), 'routing': 'balanced'}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        jobs = list(pool.map(lambda _: service.submit(body)[0], range(12)))
+        repeats = list(pool.map(lambda _: service.submit({**body, 'idempotency_key': 'same'}), range(8)))
+    assert sum(j['account'] == 'a' for j in jobs) == 6
+    assert sum(j['account'] == 'b' for j in jobs) == 6
+    assert len({j['id'] for j, _ in repeats}) == 1
+    assert sum(created for _, created in repeats) == 1
+    service.stop()
+
+
+def test_clean_device_starts_without_phantom_accounts_and_restores_login(tmp_path, monkeypatch):
+    import magpie_wan.service as module
+    from unittest.mock import Mock
+    monkeypatch.delenv('WAN_MODELSCOPE_ACCOUNTS', raising=False)
+    monkeypatch.delenv('WAN_MODELSCOPE_CDP_URLS', raising=False)
+    assert parse_accounts() == {}
+    service = WanService(data_dir=tmp_path / 'data', accounts={}, media_roots=[tmp_path])
+    service.start()
+    assert service.accounts == []
+    browser = tmp_path / 'chrome'
+    browser.touch()
+    monkeypatch.setattr(module, '_browser_executable', lambda: browser)
+    process = Mock()
+    process.poll.return_value = None
+    monkeypatch.setattr(module.subprocess, 'Popen', Mock(return_value=process))
+    ports = iter([19460, 19461])
+    monkeypatch.setattr(module, '_free_cdp_port', lambda **kwargs: next(ports))
+    monkeypatch.setattr(service, '_start_account_worker', lambda _: None)
+    account = service.launch_browser_account(pending=True)['id']
+    assert account == 'account-1'
+    service.store.verify_identity(account, 'Name:original')
+    service.activate_browser_account(account)
+    service.stop()
+    restored = WanService(data_dir=tmp_path / 'data', accounts={}, media_roots=[tmp_path])
+    monkeypatch.setattr(restored, '_start_account_worker', lambda _: None)
+    restored.start()
+    assert restored.accounts == ['account-1']
+    assert restored.account_urls[account].endswith(':19461')
+    restored.store.verify_identity(account, 'Name:original')
+    with pytest.raises(ServiceError, match='identity mismatch'):
+        restored.store.verify_identity(account, 'Name:other')
+    restored.stop()
+
+
+def test_blockage_preserves_provider_history_and_separates_timing(tmp_path):
+    import time
+    service = make_service(tmp_path)
+    frame = make_frame(tmp_path / 'frame.png')
+    first = service.submit({'prompt': 'one', 'first_frame': str(frame)})[0]
+    second = service.submit({'prompt': 'two', 'first_frame': str(frame)})[0]
+    now = time.time()
+    service.store.update(first['id'], status='in_progress', provider_task_id='remote', provider_status='RUNNING',
+                         submitted_at=now-300, started_at=now-310, last_polled_at=now-200)
+    service.account_profiles['account-1'].update(status='unavailable', checked_at=now)
+    service._account_unavailable_since['account-1'] = now-100
+    public = service.job_details(service.store.get(first['id']))
+    assert public['status'] == 'in_progress'
+    assert public['last_confirmed_provider_status'] == 'RUNNING'
+    assert '账号连接' in public['progress_message']
+    assert public['timing']['connection_unavailable_seconds'] >= 100
+    assert public['timing']['generation_seconds'] >= 300
+    assert public['blockage']['waiting_job_ids'] == [second['id']]
+    assert service.public_job(second)['blockage']['blocked_by_job_id'] == first['id']
+    assert public['quality_acceptance'] == 'not_evaluated'
+    assert any(e['kind'] == 'in_progress' for e in public['events'])
+    service.stop()
+
+
+def test_local_queue_controls_preserve_submitted_jobs_and_audit_reassignment(tmp_path):
+    import time
+    service = make_service(tmp_path, {'a': 'http://localhost:9301', 'b': 'http://localhost:9302'})
+    frame = make_frame(tmp_path / 'frame.png')
+    job = service.submit({'prompt': 'one', 'first_frame': str(frame), 'account': 'a'})[0]
+    assert service.control_job(job['id'], {'action': 'pause'})['status'] == 'paused'
+    assert service.store.next_for_account('a') is None
+    service.account_profiles['b'].update(status='connected', checked_at=time.time())
+    assert service.control_job(job['id'], {'action': 'reassign', 'account': 'b'})['account'] == 'b'
+    assert service.control_job(job['id'], {'action': 'resume'})['status'] == 'queued'
+    assert service.store.next_for_account('b')['id'] == job['id']
+    service._account_operations['b'].acquire()
+    try:
+        with pytest.raises(ServiceError, match='正在操作'):
+            service.control_job(job['id'], {'action': 'cancel'})
+    finally:
+        service._account_operations['b'].release()
+    assert service.control_job(job['id'], {'action': 'cancel'})['status'] == 'cancelled'
+    assert service.store.active_counts(['b'])['b'] == 0
+    assert service.public_job(service.store.get(job['id']))['poll_after_seconds'] is None
+    events = service.store.events(job['id'])
+    assert any(e.get('previous_account') == 'a' and e.get('account') == 'b' for e in events)
+    for status in ('uploading', 'submitting', 'unknown_submission', 'in_progress', 'download_pending', 'completed'):
+        service.store.update(job['id'], status=status, provider_task_id='existing' if status != 'unknown_submission' else None)
+        for action in ('cancel', 'pause', 'reassign', 'resume'):
+            with pytest.raises(ServiceError, match='尚未提交'):
+                service.control_job(job['id'], {'action': action, 'account': 'a'})
+    service.stop()
+
+
+def test_failure_details_are_stage_specific_and_do_not_dump_private_responses(tmp_path):
+    from unittest.mock import Mock
+    service = make_service(tmp_path)
+    frame = make_frame(tmp_path / 'frame.png')
+    def job():
+        return service.submit({'prompt': 'one', 'first_frame': str(frame)})[0]
+    client = Mock()
+    current = job()
+    client.upload.side_effect = ValueError('private /Users/example path cookie=secret')
+    service._submit_job(client, current)
+    public = service.job_details(service.store.get(current['id']))
+    assert public['failure']['stage'] == 'upload'
+    assert public['recovery']['safe_to_resubmit']
+    assert 'private' not in str(public['failure'])
+    client.upload.side_effect = None
+    client.estimate.side_effect = provider.ModelScopeAPIError('/quote', 503, 'UNAVAILABLE')
+    current = job()
+    service._submit_job(client, current)
+    failure = service.public_job(service.store.get(current['id']))['failure']
+    assert failure['stage'] == 'estimate' and failure['http_status'] == 503
+    client.estimate.side_effect = None
+    client.estimate.return_value = 10
+    client.submit.side_effect = TimeoutError('token=private')
+    current = job()
+    service._submit_job(client, current)
+    public = service.public_job(service.store.get(current['id']))
+    assert public['internal_status'] == 'unknown_submission'
+    assert not public['recovery']['safe_to_resubmit']
+    assert public['recovery']['action'] == 'reconcile'
+    for body in ({'provider_task_id': 'task', 'confirm_no_task': True}, {}, {'provider_task_id': 'https://secret'}):
+        with pytest.raises(ServiceError):
+            service.control_job(current['id'], {'action': 'resolve', **body})
+    linked = service.control_job(current['id'], {'action': 'resolve', 'provider_task_id': 'task-123'})
+    assert linked['provider_task_id'] == 'task-123'
+    client.status.return_value = {'status': 'FAILED', 'errorCode': 'BAD_INPUT',
+        'errorMessage': 'invalid token=secret https://secret.url/path?password=123',
+        'cookies': 'NEVER_COPY_THIS_FIELD'}
+    service._poll_job(client, linked)
+    public = service.job_details(service.store.get(current['id']))
+    assert public['failure']['provider_code'] == 'BAD_INPUT'
+    assert 'secret' not in str(public['failure'])
+    assert 'NEVER_COPY' not in str(public)
+    assert not public['recovery']['safe_to_resubmit']
+    assert public['recovery']['actual_charge'] is None
+    client.status.return_value = {'status': 'FAILED'}
+    service._poll_job(client, linked)
+    assert '服务端未提供原因' in service.store.get(current['id'])['error']
+    service.stop()
+
+
+def test_models_diagnostics_and_control_http_authentication(tmp_path):
+    import threading
+    import requests
+    from http.server import ThreadingHTTPServer
+    from magpie_wan.service import make_handler, PROTOCOL_VERSION
+    service = make_service(tmp_path)
+    frame = make_frame(tmp_path / 'frame.png')
+    job = service.submit({'prompt': 'one', 'first_frame': str(frame)})[0]
+    server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(service, 'private'))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_port}'
+    headers = {'Authorization': 'Bearer private'}
+    try:
+        assert requests.get(base+'/v1/diagnostics', timeout=3).status_code == 401
+        assert requests.post(base+f'/v1/videos/{job["id"]}/control', json={'action': 'cancel'}, timeout=3).status_code == 401
+        health = requests.get(base+'/v1/diagnostics', headers=headers, timeout=3).json()
+        assert health['protocol_version'] == PROTOCOL_VERSION
+        assert health['affected_jobs'][0]['id'] == job['id']
+        models = requests.get(base+'/v1/models', headers=headers, timeout=3).json()['data']
+        assert len(models) == 3
+        assert models[2]['id'] == 'wan2.2-ti2v-5b'
+        assert not models[2]['last_frame_supported']
+        assert models[2]['provider_verified_at'] is None
+        assert models[2]['quality_acceptance'] == 'not_evaluated'
+        result = requests.post(base+f'/v1/videos/{job["id"]}/control', headers=headers,
+                               json={'action': 'pause'}, timeout=3)
+        assert result.status_code == 200 and result.json()['status'] == 'paused'
+    finally:
+        server.shutdown(); thread.join(timeout=3); server.server_close(); service.stop()

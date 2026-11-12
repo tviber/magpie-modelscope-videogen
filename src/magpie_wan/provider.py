@@ -237,7 +237,10 @@ class MS:
             data = response.get("Data") or {}
             if data.get("success") and (data.get("data") or {}).get("taskId"):
                 return data["data"]["taskId"]
-            message = data.get("message") or response.get("Message") or json.dumps(response, ensure_ascii=False)[:200]
+            # A missing reason must not turn the whole response (which can
+            # contain private URLs or session data) into a persisted exception.
+            message = data.get("message") or response.get("Message")
+            message = message if isinstance(message, str) else ""
             if "正在" in message or "进行中" in message or "排队" in message:
                 time.sleep(30)
                 continue
