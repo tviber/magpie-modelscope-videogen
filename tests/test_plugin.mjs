@@ -6,7 +6,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 import test from "node:test"
 
-const { MagpieWanTools, default: defaultPlugin } = await import(process.env.WAN_TEST_PLUGIN || "../index.mjs")
+const { MagpieVideoGenTools, default: defaultPlugin } = await import(process.env.WAN_TEST_PLUGIN || "../index.mjs")
 // Capture before MockTimers is enabled: filesystem polling needs real time.
 const realTimeout = globalThis.setTimeout
 
@@ -23,9 +23,9 @@ async function fixture(t, handler, options = {}) {
     await rm(outputDir, { recursive: true, force: true })
   })
   const opts = { serverUrl: `http://127.0.0.1:${server.address().port}`, outputDir, ...options }
-  const plugin = await MagpieWanTools(options.testInput || {}, opts)
-  assert.equal(Object.keys(plugin.tool).length, 11)
-  return { tool: plugin.tool.wan_get_video_result, outputDir, tools: plugin.tool, plugin, options: opts }
+  const plugin = await MagpieVideoGenTools(options.testInput || {}, opts)
+  assert.equal(Object.keys(plugin.tool).length, 14)
+  return { tool: plugin.tool.videogen_get_video_result, outputDir, tools: plugin.tool, plugin, options: opts }
 }
 
 test("result download authenticates and returns a readable local artifact without a token URL", async t => {
@@ -59,12 +59,12 @@ test("unfinished result returns status without creating an artifact", async t =>
 
 test("only video submissions opt into native Magpie routing history", async t => {
   const { tools } = await fixture(t, (_req, res) => res.end("{}"))
-  assert.deepEqual(tools.wan_generate_i2v.magpie.route, {
+  assert.deepEqual(tools.videogen_generate_i2v.magpie.route, {
     provider: "modelscope-wan", modelArg: "model", defaultModel: "wan2.2-i2v-a14b",
   })
-  assert.equal(tools.wan_generate_flf2v.magpie.route.defaultModel, "wan2.1-flf2v-14b")
+  assert.equal(tools.videogen_generate_flf2v.magpie.route.defaultModel, "wan2.1-flf2v-14b")
   for (const [name, definition] of Object.entries(tools)) {
-    if (!name.startsWith("wan_generate_")) assert.equal(definition.magpie?.route, undefined, name)
+    if (!name.startsWith("videogen_generate_")) assert.equal(definition.magpie?.route, undefined, name)
   }
 })
 
@@ -87,20 +87,28 @@ test("submit checks the allowed roots before posting and can copy an outside fra
     res.end()
   })
   const args = { prompt: "A camera move", first_frame: source }
-  await assert.rejects(tools.wan_generate_i2v.execute(args, { abort: new AbortController().signal }), /Allowed directories/)
+  await assert.rejects(tools.videogen_generate_i2v.execute(args, { abort: new AbortController().signal }), /Allowed directories/)
   assert.equal(submitted, undefined)
-  await tools.wan_generate_i2v.execute({ ...args, copy_to_media_root: true }, { abort: new AbortController().signal })
+  await tools.videogen_generate_i2v.execute({ ...args, copy_to_media_root: true }, { abort: new AbortController().signal })
   assert.ok(submitted.first_frame.includes("wan-media-"))
   assert.ok(submitted.first_frame !== source)
   assert.equal(submitted.routing, "balanced")
-  await tools.wan_generate_i2v.execute({ ...args, copy_to_media_root: true,
+  await tools.videogen_generate_i2v.execute({ ...args, copy_to_media_root: true,
     routing: "preferred", preferred_account: "account-2" }, {})
   assert.equal(submitted.routing, "preferred")
   assert.equal(submitted.preferred_account, "account-2")
+  await tools.videogen_generate_i2v.execute({ ...args, copy_to_media_root: true, model: "minimax-h3" }, {})
+  assert.equal(submitted.model, "minimax-h3")
+  assert.equal(submitted.last_frame, undefined)
+  await tools.videogen_generate_flf2v.execute({ ...args, last_frame: source,
+    copy_to_media_root: true, model: "minimax-h3", seconds: 3 }, {})
+  assert.equal(submitted.model, "minimax-h3")
+  assert.ok(submitted.last_frame.includes("wan-media-"))
+  assert.equal(submitted.seconds, 3)
 })
 
 test("one plugin export and independent account labels and magicube wallets", async t => {
-  assert.equal(defaultPlugin, MagpieWanTools)
+  assert.equal(defaultPlugin, MagpieVideoGenTools)
   const profiles = [
     { id: "a", label: "Alice", status: "connected", balance: 45, stale: false },
     { id: "b", label: "Bob", status: "connected", balance: 0, stale: false },
@@ -245,8 +253,8 @@ test("symlinks do not bypass input roots and validation failures clean staged co
     if (req.url === "/v1/media/roots") return res.end(JSON.stringify({ roots: [allowed] }))
     res.writeHead(400).end('{"error":{"message":"frame file is not a readable image"}}')
   })
-  await assert.rejects(tools.wan_prepare_frames.execute({ first_frame: linked }), /outside WAN_MEDIA_ROOTS/)
-  await assert.rejects(tools.wan_prepare_frames.execute({ first_frame: linked, copy_to_media_root: true }), /readable image/)
+  await assert.rejects(tools.videogen_prepare_frames.execute({ first_frame: linked }), /outside WAN_MEDIA_ROOTS/)
+  await assert.rejects(tools.videogen_prepare_frames.execute({ first_frame: linked, copy_to_media_root: true }), /readable image/)
   assert.deepEqual(await readdir(allowed), ["linked.png"])
 })
 
@@ -298,7 +306,7 @@ test("completion watcher resumes persisted tasks, downloads once and emits usefu
   })
   const state = join(outputDir, `watch-${createHash("sha256").update(opts.serverUrl).digest("hex").slice(0, 24)}.json`)
   await writeFile(state, JSON.stringify(["watched"]))
-  await MagpieWanTools({ client: { tui: { showToast: async payload => { notifications.push(payload.body) } } } }, opts)
+  await MagpieVideoGenTools({ client: { tui: { showToast: async payload => { notifications.push(payload.body) } } } }, opts)
   // Filesystem completion is not tied to an event-loop iteration count, especially
   // on Windows. Advance the watch timer until notified, then wait for the atomic
   // state write, with a real deadline (performance is not mocked).
@@ -383,21 +391,21 @@ test("Magpie balance switch and standalone options expose the effective routing"
     } } },
   })
   assert.equal(plugin.auth.options[0].default, true)
-  assert.equal((await tools.wan_get_config.execute()).routing, "balanced")
+  assert.equal((await tools.videogen_get_config.execute()).routing, "balanced")
   balanced = false
-  const config = await tools.wan_get_config.execute()
+  const config = await tools.videogen_get_config.execute()
   assert.equal(config.routing, "preferred")
   assert.equal(config.preferred_account, "account-2")
   const standalone = await fixture(t, (_req, res) => res.end('{"roots":[]}'), { routing: "preferred" })
-  assert.equal((await standalone.tools.wan_get_config.execute()).routing, "preferred")
+  assert.equal((await standalone.tools.videogen_get_config.execute()).routing, "preferred")
 })
 
 
 test("operational tools send local controls and explicit reconciliation and check service protocol", async t => {
   const seen = []
-  let protocol = 2
+  let protocol = 3
   const { tools } = await fixture(t, async (req, res) => {
-    if (req.url === '/health') return res.end(JSON.stringify({ protocol_version: protocol, service_version: '0.0.1' }))
+    if (req.url === '/health') return res.end(JSON.stringify({ protocol_version: protocol, service_version: '0.1.0' }))
     if (req.url === '/v1/diagnostics') return res.end('{"workers":[],"accounts":[],"affected_jobs":[]}')
     if (req.url === '/v1/models') return res.end('{"data":[{"id":"wan2.2-ti2v-5b"}]}')
     if (req.method === 'POST') {
@@ -408,14 +416,37 @@ test("operational tools send local controls and explicit reconciliation and chec
     }
     res.writeHead(404).end()
   })
-  assert.equal((await tools.wan_get_models.execute({})).data[0].id, 'wan2.2-ti2v-5b')
-  assert.equal((await tools.wan_diagnose.execute({})).compatible, true)
+  assert.equal((await tools.videogen_get_models.execute({})).data[0].id, 'wan2.2-ti2v-5b')
+  assert.equal((await tools.videogen_diagnose.execute({})).compatible, true)
   protocol = 1
-  assert.equal((await tools.wan_diagnose.execute({})).compatible, false)
-  await tools.wan_control_job.execute({ job_id: 'job', action: 'reassign', account: 'b' })
-  await tools.wan_reconcile_job.execute({ job_id: 'job', provider_task_id: 'remote' })
+  assert.equal((await tools.videogen_diagnose.execute({})).compatible, false)
+  await tools.videogen_control_job.execute({ job_id: 'job', action: 'reassign', account: 'b' })
+  await tools.videogen_reconcile_job.execute({ job_id: 'job', provider_task_id: 'remote' })
   assert.deepEqual(seen, [
     { url: '/v1/videos/job/control', body: { action: 'reassign', account: 'b' } },
     { url: '/v1/videos/job/resolve', body: { provider_task_id: 'remote' } },
   ])
+})
+
+test("text generation and quote forward parameters without frame preparation", async t => {
+  const seen = []
+  const { tools } = await fixture(t, async (req, res) => {
+    let body = ''; for await (const part of req) body += part
+    seen.push({url:req.url, body:JSON.parse(body)})
+    res.end(JSON.stringify({id:'job',status:'queued'}))
+  }, { watchJobs:false })
+  await tools.videogen_generate_t2v.execute({model:'ltx-2.3',prompt:'hello', accelerate_lora:false,
+    num_inference_steps:25, guidance_scale:4, loras:[{model_version_id:99,scale:.6}],add_watermark:true})
+  assert.equal(seen[0].url, '/v1/videos')
+  assert.equal(seen[0].body.mode, 't2v')
+  assert.equal(seen[0].body.first_frame, undefined)
+  assert.equal(seen[0].body.num_inference_steps,25)
+  assert.deepEqual(seen[0].body.loras,[{model_version_id:99,scale:.6}])
+  await tools.videogen_estimate.execute({model:'minimax-h3',prompt:'hello',accelerate_lora:true})
+  assert.equal(seen[1].url,'/v1/videos/estimate')
+  assert.equal(seen[1].body.mode,'t2v')
+  assert.equal(tools.videogen_estimate.magpie,undefined)
+  await tools.videogen_search_models.execute({model:'ltx-2.3',model_type:'LoRA',query:'film'})
+  assert.equal(seen[2].url,'/v1/models/search')
+  assert.ok(Object.keys(tools).every(name=>name.startsWith('videogen_')))
 })

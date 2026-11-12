@@ -1,4 +1,4 @@
-"""ModelScope's browser-session adapter for WAN video generation.
+"""ModelScope's browser-session adapter for WAN and MiniMax video generation.
 
 This module only speaks to ModelScope. It does not own project shot names,
 artifact manifests, acceptance state, output layout, or prompt preferences.
@@ -172,6 +172,38 @@ class MS:
     def balance(self):
         return self.get("/openapi/v1/magicubes/balance").get("data")
 
+    def catalog(self, model, model_type="LoRA", query="", page=1, page_size=16):
+        self._check_identity()
+        response = self._api("put", "/api/v1/dolphin/models", data={
+            "PageSize": page_size, "PageNumber": page, "SortBy": "AigcDefault", "Target": "",
+            "IsAigc": True, "Name": query, "IsStar": False,
+            "SingleCriterion": [
+                {"category": "aigc_type", "DateType": "string", "predicate": "equal", "StringValue": model_type},
+                {"category": "vision_foundation", "DateType": "string", "predicate": "equal", "StringValue": "all"}],
+            "Criterion": [{"category": "sub_vision_foundation", "predicate": "contains", "values": [model]}],
+        })
+        data = (response.get("Data") or {}).get("Model") or {}
+        records = []
+        for item in data.get("Models") or []:
+            muse = item.get("MuseInfo") or {}
+            versions = []
+            for version in muse.get("versions") or []:
+                info = version.get("modelVersion") or {}
+                words = info.get("triggerWords") or []
+                if isinstance(words, str):
+                    try:
+                        words = json.loads(words)
+                    except ValueError:
+                        words = [words]
+                versions.append({"model_version_id": version.get("id"),
+                                 "name": info.get("showName") or info.get("versionName"),
+                                 "model_url": info.get("modelUrl"), "trigger_words": words,
+                                 "base_model": version.get("stableDiffusionSubVersion")})
+            if versions:
+                records.append({"name": (muse.get("model") or {}).get("modelName"),
+                                "type": model_type, "versions": versions})
+        return {"data": records, "total": data.get("TotalCount"), "page": page, "page_size": page_size}
+
     def me(self):
         """Return the signed-in identity, or None when the session is not logged in."""
         try:
@@ -204,7 +236,9 @@ class MS:
         })["Data"]["DownloadUrl"]
 
     def request(self, model, start_url, end_url, prompt, seconds, *, width=None, height=None,
-                style=None, negative_prompt=None, seed=-1):
+                style=None, negative_prompt=None, seed=-1, mode="i2v", accelerate_lora=False,
+                num_inference_steps=None, guidance_scale=None, loras=None,
+                checkpoint_version_id=None, vae_version_id=None, add_watermark=False):
         width, height = self._size(width, height, self.default_size)
         prompt_args = {"prompt": prompt}
         if style:
@@ -212,13 +246,28 @@ class MS:
         if negative_prompt is not None:
             prompt_args["negativePrompt"] = negative_prompt
         request = {
-            "predictType": "IMG_2_VIDEO",
+            "predictType": "TXT_2_VIDEO" if mode == "t2v" else "IMG_2_VIDEO",
             "promptArgs": prompt_args,
             "basicDiffusionArgs": {"width": width, "height": height, "totalSeconds": seconds, "seed": seed},
-            "modelArgs": {"checkpointModelVersionId": self.models[model]["versionId"], "loraArgs": []},
-            "videoInferenceArgs": {"accelerateLora": False},
-            "imageInputFrontArgs": {"image": start_url, "stength": 1},
+            "modelArgs": {"checkpointModelVersionId": checkpoint_version_id or self.models[model]["versionId"],
+                          "loraArgs": [{"modelVersionId": l["model_version_id"], "scale": l.get("scale", 1)} for l in loras or []]},
+            "videoInferenceArgs": {"accelerateLora": accelerate_lora},
+            "addWaterMark": add_watermark,
         }
+        defaults = self.models[model].get("defaultParams", {}).get("basicDiffusionArgs", {})
+        steps = 4 if accelerate_lora else num_inference_steps or defaults.get("numInferenceSteps")
+        if steps is not None:
+            request["basicDiffusionArgs"]["numInferenceSteps"] = steps
+        guidance = guidance_scale if guidance_scale is not None else defaults.get("guidanceScale")
+        if guidance is not None:
+            request["basicDiffusionArgs"]["guidanceScale"] = guidance
+        if vae_version_id is not None:
+            request["modelArgs"]["vaeModelVersionId"] = vae_version_id
+        words = list(dict.fromkeys(w for l in loras or [] for w in l.get("trigger_words", []) if w))
+        if words:
+            prompt_args["prompt"] = prompt_args["prompt"].rstrip(",") + "," + ",".join(words)
+        if start_url:
+            request["imageInputFrontArgs"] = {"image": start_url, "stength": 1}
         if end_url:
             request["extraImageInputFrontArgs"] = {"image": end_url, "stength": 1}
         return request
@@ -231,7 +280,8 @@ class MS:
         return (response.get("Data") or {}).get("data")
 
     def submit(self, request):
-        body = dict(request, addWaterMark=False)
+        body = dict(request)
+        body.setdefault("addWaterMark", False)
         for _ in range(60):
             response = self.post("/api/v1/muse/predict/task/video/submit", body)
             data = response.get("Data") or {}

@@ -1,22 +1,95 @@
-# ModelScope WAN tools for Magpie
+# ModelScope VideoGen for Magpie
 
-A standalone Magpie tools plugin and local Python service for submitting image-to-video jobs to WAN models through already signed-in ModelScope browser sessions.
+A Magpie video generation plugin with a local, headless-browser service for all nine current ModelScope AIGC video models: MiniMax-H3, LTX 2.3, WAN 2.2 and WAN 2.1.
 
-The package runs locally. Magpie calls eleven tools; the Python service queues the request and continues polling ModelScope after the tool call returns:
+The package runs locally. Magpie calls fourteen tools; the Python service queues the request and continues polling ModelScope after the tool call returns:
 
-- `wan_generate_flf2v`: generate from a first frame and a required final frame.
-- `wan_generate_i2v`: generate from a first frame.
-- `wan_get_video_status`: check progress.
-- `wan_get_video_result`: download the completed video, input-frame previews, manifest and local HTML preview.
-- `wan_get_config`: show allowed input directories and account connection/balance snapshots.
-- `wan_prepare_frames`: validate frames; explicitly set `copy_to_media_root=true` to stage outside images.
-- `wan_list_video_jobs`: list and paginate tasks, optionally filtered by project.
-- `wan_get_models`: list adapter model capabilities and local download verification times.
-- `wan_diagnose`: inspect plugin/service version compatibility, workers, accounts and affected jobs.
-- `wan_control_job`: pause/resume/cancel unsubmitted local jobs or explicitly reassign them.
-- `wan_reconcile_job`: reconcile an ambiguous submission with its original provider task.
+- `videogen_generate_flf2v`: generate from a first frame and a required final frame.
+- `videogen_generate_i2v`: generate from a first frame.
+- `videogen_generate_t2v`: generate from text without input frames.
+- `videogen_estimate`: fetch the official magicube quote without uploading or generating.
+- `videogen_search_models`: search matching Checkpoint, LoRA and VAE versions and trigger words.
+- `videogen_get_video_status`: check progress.
+- `videogen_get_video_result`: download the completed video, input-frame previews, manifest and local HTML preview.
+- `videogen_get_config`: show allowed input directories and account connection/balance snapshots.
+- `videogen_prepare_frames`: validate frames; explicitly set `copy_to_media_root=true` to stage outside images.
+- `videogen_list_video_jobs`: list and paginate tasks, optionally filtered by project.
+- `videogen_get_models`: list adapter model capabilities and local download verification times.
+- `videogen_diagnose`: inspect plugin/service version compatibility, workers, accounts and affected jobs.
+- `videogen_control_job`: pause/resume/cancel unsubmitted local jobs or explicitly reassign them.
+- `videogen_reconcile_job`: reconcile an ambiguous submission with its original provider task.
 
 The service exposes `GET /v1/models`, `POST /v1/videos`, `GET /v1/videos/{id}` and `GET /v1/videos/{id}/content`. It binds to loopback by default. It does not require or store a ModelScope password or API key; it uses the browser sessions you configure.
+
+
+## VideoGen 0.1.0 model and parameter support
+
+The npm/plugin name is **`magpie-modelscope-videogen`**. Local folder installs
+load the package name from `package.json`; disable and enable the installed
+plugin after updating. Existing local paths, Python module/command
+(`magpie-wan-service`), `WAN_*` environment variables, browser profiles, database,
+job IDs and result/watch directories are retained to preserve existing data.
+The repository is now [tviber/magpie-modelscope-videogen](https://github.com/tviber/magpie-modelscope-videogen).
+The renamed plugin advertises only the new
+`videogen_*` tools, so update explicit tool allowlists and MCP assignments.
+Magpie truncates the plugin portion of exposed MCP names: the installed prefix
+is `magpie-modelscope-videog_`, for example
+`magpie-modelscope-videog_videogen_generate_i2v`. The per-plugin endpoint follows
+that prefix: `/mcp/magpie/tools/magpie-modelscope-videog`. The combined endpoint
+is still `/mcp/magpie/tools`.
+
+| Model ID | Text | First frame | First/last frames |
+| --- | --- | --- | --- |
+| `minimax-h3` | Yes | Yes | Yes |
+| `ltx-2.3` | Yes | Yes | Yes |
+| `wan2.2-ti2v-5b` | Yes | Yes | No |
+| `wan2.2-i2v-a14b` | No | Yes | No |
+| `wan2.2-t2v-a14b` | Yes | No | No |
+| `wan2.1-flf2v-14b` | No | Yes (legacy adapter) | Yes |
+| `wan2.1-i2v-14b` | No | Yes | No |
+| `wan2.1-t2v-14b` | Yes | No | No |
+| `wan2.1-t2v-1.3b` | Yes | No | No |
+
+Generation parameters are persisted with jobs, included in request deduplication,
+and exported in manifests:
+
+| Parameter | Behavior |
+| --- | --- |
+| `accelerate_lora` | H3 default true, others false; true uses 4 steps |
+| `num_inference_steps` | 1–50, requires acceleration off unless set to 4 |
+| `guidance_scale` | 1.5–20; omitted uses the official model default if present |
+| `checkpoint_version_id` / `vae_version_id` | Compatible custom version IDs from model search |
+| `loras` | Up to 6 objects: `model_version_id`, `scale` (−10 to 10, default 1), optional `trigger_words` array |
+| `add_watermark` | Boolean, default false |
+| `seed`, `negative_prompt`, `style` | Per-request controls; no implicit prompt or style added |
+| `size`, `seconds` | Custom dimensions and whole-second duration; actual specs reported on completion |
+
+Search uses ModelScope's official AIGC catalog, filtered to the selected model
+family. It returns version IDs and trigger words; select compatible versions.
+Trigger words are appended to the effective provider prompt. The manifest
+retains the original prompt and the LoRA configuration. Explicitly supplied
+checkpoint/VAE/LoRA IDs are ultimately validated by ModelScope.
+
+For example, call `videogen_generate_t2v` with:
+
+```json
+{
+  "model": "ltx-2.3",
+  "prompt": "A red ball rolls across a wooden table. Static camera.",
+  "seconds": 3,
+  "size": "1280x768",
+  "accelerate_lora": false,
+  "num_inference_steps": 30,
+  "guidance_scale": 4
+}
+```
+
+`videogen_estimate` accepts generation parameters plus `mode: "t2v" | "i2v"`;
+image mode validates local frame paths but does not upload them. Omitting mode
+infers it from the presence of `first_frame`. `videogen_search_models` accepts
+`model`, `model_type: "Checkpoint" | "LoRA" | "VAE"`, `query`, `page`, `page_size`
+and optional `account`. Both operations serialize with the selected account's
+worker and return busy if that account is currently submitting a job.
 
 ## Requirements
 
@@ -115,7 +188,7 @@ The folder install loads the source in place, so install its npm dependencies fi
 The default plugin service URL is `http://127.0.0.1:8765`. If you use a different local port, set its URL:
 
 ```sh
-magpie plugin options magpie-modelscope-wan '{"serverUrl":"http://127.0.0.1:8766"}'
+magpie plugin options magpie-modelscope-videogen '{"serverUrl":"http://127.0.0.1:8766"}'
 ```
 
 If you also set `WAN_SERVICE_TOKEN` for the service, give Magpie the same token in its local plugin options. Keep the real token out of shell history and source control.
@@ -155,7 +228,7 @@ option supplies the preferred account ID; when omitted, the first eligible
 account in service order is used. An explicitly configured unavailable preferred
 account returns an error. Each generation call can override with
 `routing: "balanced" | "preferred"` and `preferred_account: "account-2"`.
-An explicit `account` always pins the job to that account. `wan_get_config`
+An explicit `account` always pins the job to that account. `videogen_get_config`
 reports the effective mode. Outside Magpie the plugin's `routing` option defaults
 to `balanced`. Direct HTTP requests omitting `routing` retain legacy queue-only
 selection for compatibility.
@@ -169,7 +242,7 @@ guarantee that the wallet can cover a job's as-yet-unknown quote.
 
 ## Frame preparation, projects and completion
 
-Run `wan_get_config` to see `WAN_MEDIA_ROOTS`. Submission preflight resolves symlinks, validates each image through the service and reports allowed directories before any generation. With `copy_to_media_root=true`, the plugin copies only the explicitly supplied files into a private staging subdirectory of the first allowed root. This requires the plugin and service on the same computer. The service still validates roots, size and image contents; it never gets an unrestricted filesystem-copy endpoint. Failed preparation removes staging copies. Successful staging copies remain until you delete them; this permits retries after ambiguous network failures.
+Run `videogen_get_config` to see `WAN_MEDIA_ROOTS`. Submission preflight resolves symlinks, validates each image through the service and reports allowed directories before any generation. With `copy_to_media_root=true`, the plugin copies only the explicitly supplied files into a private staging subdirectory of the first allowed root. This requires the plugin and service on the same computer. The service still validates roots, size and image contents; it never gets an unrestricted filesystem-copy endpoint. Failed preparation removes staging copies. Successful staging copies remain until you delete them; this permits retries after ambiguous network failures.
 
 Example tool arguments:
 
@@ -187,7 +260,7 @@ Example tool arguments:
 }
 ```
 
-`project` and `shot` persist across restarts and are included in request deduplication. `wan_list_video_jobs` accepts `project`, `limit` (1–200) and `offset`; pass the returned `next_offset` to continue. Omitting project lists all recent jobs.
+`project` and `shot` persist across restarts and are included in request deduplication. `videogen_list_video_jobs` accepts `project`, `limit` (1–200) and `offset`; pass the returned `next_offset` to continue. Omitting project lists all recent jobs.
 
 Status now includes an explicit phase, queue position, elapsed seconds, the last successful provider poll and a stale indicator. A running task's percentage and ETA are `null`: ModelScope does not supply reliable values and the former fixed 50% was not measured progress. On completion, `requested` and ffprobe-measured `actual` show duration, dimensions and FPS, with `spec_warnings` for mismatches. FPS is chosen by ModelScope, so requested FPS is `null`. Existing completed files are measured lazily when their status/result is requested; a missing file or ffprobe leaves actual specs unavailable.
 
@@ -197,11 +270,65 @@ By default, tasks submitted through the plugin are watched every 15 seconds whil
 
 ## Requests and output
 
-Requests have no built-in style or negative-prompt defaults. The prompt is sent as provided; `style` and `negative_prompt` apply only when supplied on that request. `size` is optional and must preserve the frame aspect ratio; dimensions must be multiples of 16 and at most 1280 pixels. Without `size`, the service selects a supported size from the first frame. Duration is 1–10 whole seconds and defaults to 5.
+Requests have no built-in style or negative-prompt defaults. The prompt is sent as provided; `style` and `negative_prompt` apply only when supplied on that request. `size` is optional and must preserve the frame aspect ratio; dimensions must be multiples of 16 and at most 1536 pixels. Without `size`, the service selects a supported size from the first frame. Duration is 1–10 whole seconds and defaults to 5.
 
 The service copies inputs and completed videos to its private local data directory: `~/Library/Application Support/magpie-wan` on macOS, `$XDG_DATA_HOME/magpie-wan` or `~/.local/share/magpie-wan` on Linux, and `%LOCALAPPDATA%\magpie-wan` on Windows. Service status responses use relative `output_path` and `content_url` values. When authentication is enabled, that HTTP content URL requires a Bearer header.
 
-Call `wan_get_video_result` to retrieve the file: the plugin supplies the token in a header, streams the video to `~/.magpie-wan/results/wan-*/video.mp4`, and returns an absolute `output_path` plus `file_url`. Set the plugin's `outputDir` option to change the local destination. This path is on the plugin host machine and can be opened by local agents; it is not a public download link. No token is included in a URL or tool response. Aborts, failed downloads and the 50-second retrieval timeout remove partial files; call the result tool again to retry. Completed copies remain until you delete them. First-to-last-frame input currently supports `wan2.1-flf2v-14b`.
+Call `videogen_get_video_result` to retrieve the file: the plugin supplies the token in a header, streams the video to `~/.magpie-wan/results/wan-*/video.mp4`, and returns an absolute `output_path` plus `file_url`. Set the plugin's `outputDir` option to change the local destination. This path is on the plugin host machine and can be opened by local agents; it is not a public download link. No token is included in a URL or tool response. Aborts, failed downloads and the 50-second retrieval timeout remove partial files; call the result tool again to retry. Completed copies remain until you delete them. First-to-last-frame input supports `wan2.1-flf2v-14b`, `minimax-h3` and `ltx-2.3`.
+
+### MiniMax-H3 through the headless browser
+
+Use the existing tools with `model: "minimax-h3"`: `videogen_generate_i2v` takes a
+first frame, and `videogen_generate_flf2v` takes first and last frames. The same
+headless account sessions, wallet routing, durable queue, status polling and
+result downloads serve both model families. Restart the Python service and
+reload the plugin after upgrading. All exposed tool names now start with
+`videogen_`. The internal provider ID remains `modelscope-wan` to preserve saved
+logins, routing preferences and wallet history; its display name is ModelScope VideoGen.
+
+```json
+{
+  "model": "minimax-h3",
+  "prompt": "A red ball rolls smoothly from left to right across the table.",
+  "first_frame": "/absolute/workspace/first.png",
+  "last_frame": "/absolute/workspace/last.png",
+  "seconds": 3,
+  "size": "1280x720",
+  "copy_to_media_root": true
+}
+```
+
+The adapter discovers `MINIMAX_H3` and its current checkpoint version from
+ModelScope's `defaultTemplateV2`; it does not pin a checkpoint ID. New H3 jobs default to `accelerate_lora: true` (4 steps), matching the web UI.
+Other models default to false, matching the current web UI, which only shows
+this switch for H3. Explicit acceleration is forwarded for every model; a quote
+alone does not prove that a model's accelerated generation works. Disable
+acceleration to use custom sampling steps. Old queued records without saved
+parameters retain acceleration off. Text-only generation is available through
+`videogen_generate_t2v`; Omni Reference inputs are not exposed.
+
+Live official quotes verified on **2026-11-13** using a signed-in headless
+Chrome session, first/last-frame requests and 1280×720 output:
+
+| Model / setting | 3 seconds | 5 seconds | 10 seconds |
+| --- | ---: | ---: | ---: |
+| MiniMax-H3 — acceleration off | 68 魔粒 | 113 魔粒 | 225 魔粒 |
+| WAN 2.1 FLF2V 14B — default, acceleration off | 17 魔粒 | 28 魔粒 | 56 魔粒 |
+| MiniMax-H3 — default, acceleration on | 34 魔粒 | 56 魔粒 | 113 魔粒 |
+| WAN 2.1 FLF2V 14B — explicit acceleration on | 3 魔粒 | 6 魔粒 | 11 魔粒 |
+
+These are responses from
+`/api/v1/muse/predict/getEstimateConsumeComputeQuota`, not final charges or
+generation times. Each submitted job fetches and stores its own current quote;
+pricing can change. Use `videogen_estimate` with the same model, mode and
+parameters as the intended generation for a current quote.
+
+The same day's headless end-to-end check submitted a 3-second H3 first/last-frame
+job, observed `PENDING → PROCESSING → UNDER_REVIEW → SUCCEED`, downloaded its
+MP4, and retrieved the preview bundle through `videogen_get_video_result`. ffprobe
+measured **3.05 seconds, 1280×704, 24 FPS, with audio** for a requested 1280×720.
+The existing specification warning reports that size difference. This confirms
+the generation/download path, not exact dimensions or visual quality acceptance.
 
 Jobs persist across restarts. A service interruption during submission is marked `unknown_submission`; the service will not silently submit the job again. Inspect the matching ModelScope account, then reconcile the task:
 
@@ -223,7 +350,7 @@ When `WAN_SERVICE_TOKEN` is set, pass the matching bearer token to these request
 
 ## Diagnose and recover tasks
 
-Run `wan_diagnose` after upgrading. It compares plugin/service version and protocol,
+Run `videogen_diagnose` after upgrading. It compares plugin/service version and protocol,
 checks live worker threads and input roots, and lists jobs affected by unavailable
 accounts or ambiguous submissions. `compatible` means matching code versions,
 not that the account network checks all passed; inspect `accounts` and `workers`.
@@ -237,7 +364,7 @@ Generation elapsed time is wall time since submission, not measured compute time
 Connection outage time is measured since this service process detected it; old
 jobs without submission timestamps report that duration as unknown.
 
-`wan_get_video_status` includes the latest 100 persistent `events`. History starts
+`videogen_get_video_status` includes the latest 100 persistent `events`. History starts
 with this upgrade and cannot reconstruct earlier uploads or submissions. Poll
 success time is stored on each query; events record provider state changes and
 poll failures/recovery rather than every identical poll. `failure` includes stage,
@@ -247,7 +374,7 @@ entire provider responses are not persisted. No supplied reason means **服务�
 of visual success. Actual charges remain unknown unless the provider verifies
 one; `estimate` is only a quote.
 
-Use `wan_control_job` with `action: "pause" | "resume" | "cancel" | "reassign"`
+Use `videogen_control_job` with `action: "pause" | "resume" | "cancel" | "reassign"`
 and `job_id`; reassign also requires a connected destination `account`. Only
 `queued` or `paused` jobs without a provider task ID qualify. Paused jobs leave
 the runnable queue; cancelled jobs retain their inputs/history. Cancel means
@@ -257,14 +384,14 @@ and can be retried. Existing provider IDs and uncertain submissions cannot be
 cancelled or reassigned locally. Reassignment preserves the job ID and records
 the account change; the idempotency key continues referring to that same job.
 
-For `unknown_submission`, use `wan_reconcile_job` with **exactly one** of
+For `unknown_submission`, use `videogen_reconcile_job` with **exactly one** of
 `provider_task_id` or `confirm_no_task: true`, after checking the original
 ModelScope account. Linking an ID only resumes querying that ID; it is not an
 assertion that a remote task exists. Never confirm absence just because a status
 query failed. The original account and history are retained.
 
-`wan_get_models` exposes three adapter-supported models including
-`wan2.2-ti2v-5b`. Limits describe local validation, not live provider guarantees.
+`videogen_get_models` exposes all nine current adapter-supported models including
+`ltx-2.3`, `wan2.2-ti2v-5b` and `minimax-h3`. Limits describe local validation, not live provider guarantees.
 `last_local_download_success_at` is evidence of a downloaded file, not content
 acceptance; `quality_acceptance` remains `not_evaluated`. No model is marked as
 meeting an action requirement solely because its prompt requested that action.
@@ -282,7 +409,7 @@ Expired video URLs (401/403, or three other failed downloads/validations) are cl
 
 ## Validation and release
 
-Run `python -m pip install -e '.[test]'`, `python -m pytest -q`, and `npm test` for the offline regression suite. These tests use mocked provider sessions and local HTTP servers, not browsers. The CI workflow checks Linux, Windows and macOS, installs an npm tarball into a clean directory with an isolated npm cache, imports its eleven tools, and installs the Python service from the same packaged source. A configured workflow is not evidence of a successful run: require it to pass before release. Real ModelScope login, upload and generation still need a separate end-to-end check on a suitable machine.
+Run `python -m pip install -e '.[test]'`, `python -m pytest -q`, and `npm test` for the offline regression suite. These tests use mocked provider sessions and local HTTP servers, not browsers. The CI workflow checks Linux, Windows and macOS, installs an npm tarball into a clean directory with an isolated npm cache, imports its fourteen tools, and installs the Python service from the same packaged source. A configured workflow is not evidence of a successful run: require it to pass before release. Real ModelScope login, upload and generation still need a separate end-to-end check on a suitable machine.
 
 Before distributing, run `npm pack --dry-run --json` and inspect the whitelist (entry point, package metadata, Python source and documentation only). `npm pack` creates the distributable tarball; a recipient can extract it, follow the Python setup above, install npm dependencies, and run `magpie plugin add .`. No npm registry release is assumed to exist. Publishing requires a chosen license, release destination and a successful clean-install CI run; this change does not publish anything. Never distribute the runtime data directory, browser profiles or an unrelated workspace.
 
@@ -302,7 +429,23 @@ The generation tools opt into the [native plugin-video routing patch](patches/RE
 With that patched Magpie installed, agent submissions appear in Routing
 with agent, model, account, duration, submission result and WAN job ID.
 Open **Request and response** for the returned job status. HTTP 200 means
-submission succeeded; use `wan_get_video_status` for the ongoing generation
-and `wan_get_video_result` for the completed video. Polls and downloads do
+submission succeeded; use `videogen_get_video_status` for the ongoing generation
+and `videogen_get_video_result` for the completed video. Polls and downloads do
 not create duplicate generation rows. Older calls are not backfilled.
 Official Magpie without this patch continues running all tools normally.
+
+
+### VideoGen 0.1.0 live validation
+
+On 2026-11-13, the complete nine-model alias set matched the official
+`defaultTemplateV2` video list. Catalog search returned matching H3 and LTX
+LoRA versions. Two headless generation checks completed and downloaded:
+
+- LTX 2.3 text-to-video, 30 steps, CFG 4, acceleration off: quote 10 魔粒;
+  actual 3.041667 seconds, 1280×720, 24 FPS, audio and video.
+- H3 first/last-frame, acceleration on, custom LoRA version 1076964 at scale 0.1:
+  quote 34 魔粒; actual 3.05 seconds, 1280×704, 24 FPS, audio and video.
+
+These verify the specified paths and settings, not every combination of model,
+LoRA, VAE, duration or output size. In particular, lower quotes for explicit
+acceleration on non-H3 models are not generation-success evidence.

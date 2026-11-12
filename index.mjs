@@ -10,12 +10,12 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
 
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
-const PLUGIN_VERSION = "0.0.1"
-const PROTOCOL_VERSION = 2
+const PLUGIN_VERSION = "0.1.0"
+const PROTOCOL_VERSION = 3
 
 function serviceUrl(options) {
   const base = String(options?.serverUrl || DEFAULT_SERVER_URL).replace(/\/+$/, "")
-  if (!/^https?:\/\//i.test(base)) throw new Error("WAN serviceUrl must use http:// or https://")
+  if (!/^https?:\/\//i.test(base)) throw new Error("video serviceUrl must use http:// or https://")
   return base
 }
 
@@ -41,7 +41,7 @@ async function prepareFrame(path, options, signal, copyToRoot, roots, created) {
   // Resolve symlinks and '..' before checking containment; the service checks again.
   const source = await realpath(path)
   const info = await stat(source)
-  if (!info.isFile() || info.size > 30 * 1024 * 1024) throw new Error("WAN frames must be regular files no larger than 30 MiB")
+  if (!info.isFile() || info.size > 30 * 1024 * 1024) throw new Error("video frames must be regular files no larger than 30 MiB")
   const allowed = await Promise.all(roots.map(root => realpath(root)))
   let candidate = source
   if (!insideRoot(source, allowed)) {
@@ -50,7 +50,7 @@ async function prepareFrame(path, options, signal, copyToRoot, roots, created) {
     }
     const host = new URL(serviceUrl(options)).hostname
     if (!["127.0.0.1", "localhost", "[::1]"].includes(host)) throw new Error("Automatic frame copying requires a service on this computer")
-    if (!allowed.length) throw new Error("WAN service did not report an input directory")
+    if (!allowed.length) throw new Error("video service did not report an input directory")
     const directory = await mkdtemp(join(allowed[0], ".magpie-wan-"))
     created.push(directory)
     candidate = join(directory, basename(source))
@@ -87,19 +87,30 @@ async function request(options, path, init = {}) {
   })
   const payload = await response.json().catch(() => ({}))
   if (!response.ok) {
-    const message = payload?.error?.message || `WAN service returned HTTP ${response.status}`
+    const message = payload?.error?.message || `video service returned HTTP ${response.status}`
     throw Object.assign(new Error(message), { status: response.status, code: payload?.error?.code })
   }
   return payload
 }
 
-function generateArgs(includeLastFrame, defaultModel) {
+function generateArgs(includeLastFrame, defaultModel, textOnly = false) {
   const fields = {
     prompt: tool.schema.string().min(1).describe("Action and visual content for this clip."),
-    first_frame: tool.schema.string().min(1).describe("Absolute local path to the first frame image."),
+    first_frame: tool.schema.string().min(1).optional().describe("Absolute local first-frame path, required for i2v/flf2v; omit for t2v."),
     seconds: tool.schema.number().int().min(1).max(10).optional().describe("Duration in whole seconds (1–10). Defaults to 5."),
     size: tool.schema.string().optional().describe("Optional output dimensions such as 1280x720; must preserve the frame aspect ratio."),
-    model: tool.schema.enum(["wan2.1-flf2v-14b", "wan2.2-i2v-a14b", "wan2.2-ti2v-5b"]).optional().describe(`Model id; defaults to ${defaultModel}. Use wan_get_models for adapter capabilities.`),
+    model: tool.schema.string().optional().describe(`Model id; defaults to ${defaultModel}. Call videogen_get_models for all models and supported input modes.`),
+    accelerate_lora: tool.schema.boolean().optional().describe("LoRA inference acceleration; defaults on for MiniMax-H3, off for other models, uses 4 sampling steps. Disable for custom steps."),
+    num_inference_steps: tool.schema.number().int().min(1).max(50).optional().describe("Sampling steps, 1–50; disable accelerate_lora for values other than 4."),
+    guidance_scale: tool.schema.number().min(1.5).max(20).optional().describe("CFG prompt guidance coefficient."),
+    checkpoint_version_id: tool.schema.number().int().positive().optional().describe("Optional compatible custom Checkpoint version from videogen_search_models."),
+    vae_version_id: tool.schema.number().int().positive().optional().describe("Optional compatible VAE version."),
+    loras: tool.schema.array(tool.schema.object({
+      model_version_id: tool.schema.number().int().positive(),
+      scale: tool.schema.number().min(-10).max(10).optional(),
+      trigger_words: tool.schema.array(tool.schema.string().max(1000)).max(32).optional(),
+    })).max(6).optional().describe("Up to 6 compatible LoRAs, version IDs and weights; trigger words are appended to the effective prompt."),
+    add_watermark: tool.schema.boolean().optional().describe("Request provider watermark, defaults false."),
     style: tool.schema.string().optional().describe("Optional style text supplied for this request only."),
     negative_prompt: tool.schema.string().optional().describe("Optional negative prompt supplied for this request only."),
     seed: tool.schema.number().int().min(-1).optional().describe("Seed, or -1 for the provider default."),
@@ -114,19 +125,28 @@ function generateArgs(includeLastFrame, defaultModel) {
   if (includeLastFrame) {
     fields.last_frame = tool.schema.string().min(1).describe("Absolute local path to the last frame image.")
   }
+  if (textOnly) delete fields.first_frame
   return fields
 }
 
-function submitTool(options, includeLastFrame, defaultModel, watch) {
+function submitTool(options, includeLastFrame, defaultModel, watch, textOnly = false) {
   return tool({
     magpie: { route: { provider: "modelscope-wan", modelArg: "model", defaultModel } },
-    description: includeLastFrame
-      ? "Submit a WAN first-frame-to-last-frame video job. Returns a durable job id immediately; use wan_get_video_status to check progress."
-      : "Submit a WAN first-frame-to-video job. Returns a durable job id immediately; use wan_get_video_status to check progress.",
-    args: generateArgs(includeLastFrame, defaultModel),
+    description: textOnly ? "Submit a text-to-video job without input frames. Returns a durable job id." : includeLastFrame
+      ? "Submit a ModelScope first-frame-to-last-frame video job. Returns a durable job id immediately; use videogen_get_video_status to check progress."
+      : "Submit a ModelScope first-frame-to-video job. Returns a durable job id immediately; use videogen_get_video_status to check progress.",
+    args: generateArgs(includeLastFrame, defaultModel, textOnly),
     async execute(args, ctx = {}) {
       const body = {
         prompt: args.prompt,
+        mode: textOnly ? "t2v" : "i2v",
+        accelerate_lora: args.accelerate_lora ?? options.accelerateLora,
+        num_inference_steps: args.num_inference_steps,
+        guidance_scale: args.guidance_scale,
+        checkpoint_version_id: args.checkpoint_version_id,
+        vae_version_id: args.vae_version_id,
+        loras: args.loras,
+        add_watermark: args.add_watermark,
         first_frame: args.first_frame,
         last_frame: includeLastFrame ? args.last_frame : undefined,
         seconds: args.seconds,
@@ -142,7 +162,8 @@ function submitTool(options, includeLastFrame, defaultModel, watch) {
         preferred_account: args.preferred_account || options?.preferredAccount,
         idempotency_key: args.idempotency_key,
       }
-      const prepared = await prepareFrames({ ...args, last_frame: includeLastFrame ? args.last_frame : undefined }, options, ctx.abort)
+      if (!textOnly && !args.first_frame) throw new Error("first_frame is required for image-to-video")
+      const prepared = textOnly ? { copied_directories: [] } : await prepareFrames({ ...args, last_frame: includeLastFrame ? args.last_frame : undefined }, options, ctx.abort)
       body.first_frame = prepared.first_frame
       body.last_frame = prepared.last_frame
       // The service snapshots these inputs before it acknowledges the job. Keep
@@ -165,8 +186,8 @@ function submitTool(options, includeLastFrame, defaultModel, watch) {
 
 function statusTool(options) {
   return tool({
-    description: "Check a WAN job without waiting for generation. Includes phase, progress, requested and actual video specifications when available.",
-    args: { job_id: tool.schema.string().min(1).describe("Job id returned by a WAN submit tool.") },
+    description: "Check a video job without waiting for generation. Includes phase, progress, requested and actual video specifications when available.",
+    args: { job_id: tool.schema.string().min(1).describe("Job id returned by a video submit tool.") },
     async execute({ job_id }, ctx = {}) {
       return await request(options, `/v1/videos/${encodeURIComponent(job_id)}`, { signal: ctx.abort })
     },
@@ -175,7 +196,7 @@ function statusTool(options) {
 
 function listTool(options) {
   return tool({
-    description: "List WAN jobs with prompts, input frames and specifications; filter by project and paginate with next_offset.",
+    description: "List video jobs with prompts, input frames and specifications; filter by project and paginate with next_offset.",
     args: {
       project: tool.schema.string().optional(),
       limit: tool.schema.number().int().min(1).max(200).optional(),
@@ -193,7 +214,7 @@ const hash = value => createHash("sha256").update(value).digest("hex").slice(0, 
 
 function resultRoot(options) {
   const root = options?.outputDir || join(homedir(), ".magpie-wan", "results")
-  if (!isAbsolute(root)) throw new Error("WAN outputDir must be an absolute local directory")
+  if (!isAbsolute(root)) throw new Error("video outputDir must be an absolute local directory")
   return root
 }
 
@@ -231,7 +252,7 @@ async function downloadResult(options, jobId, abort) {
     const manifest = {
       id: result.id, status: result.status, project: result.project, shot: result.shot,
       account_id: result.account_id, model: result.model, prompt: result.prompt,
-      style: result.style, negative_prompt: result.negative_prompt,
+      style: result.style, negative_prompt: result.negative_prompt, generation_params: result.generation_params,
       input_frames: frames, requested: result.requested, actual: result.actual,
       spec_warnings: result.spec_warnings, estimate: result.estimate, estimate_unit: result.estimate_unit,
       estimate_kind: result.estimate_kind, output_path: output, file_url: pathToFileURL(output).href,
@@ -241,9 +262,9 @@ async function downloadResult(options, jobId, abort) {
     const actual = result.actual
     const measured = actual ? `${actual.duration ?? "?"} 秒 · ${actual.width ?? "?"} × ${actual.height ?? "?"} · ${actual.fps ?? "?"} fps` : "实测规格暂不可用"
     const requested = result.requested
-    const html = `<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; media-src 'self' file:; img-src 'self' file:; style-src 'unsafe-inline'"><title>WAN · ${escapeHtml(result.shot || result.id)}</title>
+    const html = `<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; media-src 'self' file:; img-src 'self' file:; style-src 'unsafe-inline'"><title>ModelScope · ${escapeHtml(result.shot || result.id)}</title>
 <style>body{margin:32px auto;padding:0 24px;max-width:1000px;background:#141b20;color:#eff0e8;font:16px/1.6 Georgia,serif}h1{font-size:32px;margin-bottom:8px}video{display:block;width:100%;max-height:65vh;background:#000;border-radius:8px}p{white-space:pre-wrap;overflow-wrap:anywhere}.frames{display:flex;gap:16px;flex-wrap:wrap}.frames img{max-width:100%;max-height:180px}figure{margin:0;max-width:45%}small{color:#b7c9ca}a{color:#91d5c4}.warning{color:#f2cf8d}</style>
-<small>WAN / ${escapeHtml(result.project || "未分组")} / ${escapeHtml(result.id)}</small><h1>${escapeHtml(result.shot || "视频已完成")}</h1><video controls preload="metadata" src="video.mp4"></video>
+<small>ModelScope / ${escapeHtml(result.project || "未分组")} / ${escapeHtml(result.id)}</small><h1>${escapeHtml(result.shot || "视频已完成")}</h1><video controls preload="metadata" src="video.mp4"></video>
 <p>请求：${escapeHtml(requested ? `${requested.seconds} 秒 · ${requested.size} · 帧率由模型决定` : "未知")}<br>实际：${escapeHtml(measured)}</p><p class="warning">${escapeHtml((result.spec_warnings || []).join("\n"))}</p>
 <h2>提示词</h2><p>${escapeHtml(result.prompt)}</p><div class="frames">${frames.map(frame => `<figure><img src="${frame.role}.png" alt="${escapeHtml(frame.role)}"><figcaption>${escapeHtml(frame.name || frame.role)}</figcaption></figure>`).join("")}</div>
 <p><a href="video.mp4">打开视频</a> · <a href="manifest.json">任务与素材清单</a></p></html>`
@@ -303,9 +324,9 @@ function completionWatcher(input, options) {
           if (job.status === "completed") result = await downloadResult(options, id)
           const actual = result.actual
           const message = job.status === "completed"
-            ? `${result.project || "WAN"} / ${result.shot || id}\n${actual?.duration ?? "?"} 秒 · ${actual?.width ?? "?"}×${actual?.height ?? "?"} · ${actual?.fps ?? "?"} fps\n${result.prompt || ""}\n输入：${(result.input_frames || []).map(frame => frame.name || frame.role).join(", ")}\n预览：${result.preview_url}`
+            ? `${result.project || "ModelScope"} / ${result.shot || id}\n${actual?.duration ?? "?"} 秒 · ${actual?.width ?? "?"}×${actual?.height ?? "?"} · ${actual?.fps ?? "?"} fps\n${result.prompt || ""}\n输入：${(result.input_frames || []).map(frame => frame.name || frame.role).join(", ")}\n预览：${result.preview_url}`
             : `${id}: ${job.error || "生成失败"}`
-          await input.client.tui.showToast({ body: { title: job.status === "completed" ? "WAN 视频已完成" : "WAN 视频失败", message, variant: job.status === "completed" ? "success" : "error" } })
+          await input.client.tui.showToast({ body: { title: job.status === "completed" ? "ModelScope 视频已完成" : "ModelScope 视频失败", message, variant: job.status === "completed" ? "success" : "error" } })
           pending.delete(id)
           await persist()
         } catch (error) {
@@ -321,7 +342,7 @@ function completionWatcher(input, options) {
 const PROVIDER = "modelscope-wan"
 const CONNECT_ACCOUNT_ENV = "WAN_MAGPIE_CONNECT_ACCOUNT"
 
-export const MagpieWanTools = async (input = {}, options = {}) => {
+export const MagpieVideoGenTools = async (input = {}, options = {}) => {
   const configuredOptions = options
   options = { ...configuredOptions, get routing() {
     if (input.magpie?.option) return input.magpie.option(PROVIDER, "balance_routing") ? "balanced" : "preferred"
@@ -341,13 +362,14 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
   return {
     config: async cfg => {
       cfg.provider ??= {}
-      cfg.provider[PROVIDER] ??= { name: "ModelScope WAN", models: {} }
+      cfg.provider[PROVIDER] ??= { models: {} }
+      cfg.provider[PROVIDER].name = "ModelScope VideoGen"
     },
     auth: {
       provider: PROVIDER,
       icon,
       options: [{ key: "balance_routing", label: "均衡负载（剩余魔粒最多优先）", default: true,
-        placement: "top", description: "开启后优先使用最新有效余额最多的账号；余额相同时选队列最短。关闭后使用 WAN 首选账号（未指定时按服务账号顺序）。" }],
+        placement: "top", description: "开启后优先使用最新有效余额最多的账号；余额相同时选队列最短。关闭后使用 视频生成首选账号（未指定时按服务账号顺序）。" }],
       methods: [
         { type: "oauth", label: "登录新账号",
           async authorize(inputs, { signal } = {}) {
@@ -412,41 +434,50 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
           signIn: profile.session_error && /HTTP 401|rejected/i.test(profile.session_error) ? "expired" : undefined,
           error: profile.session_error || (profile.stale ? "账号状态尚未刷新，请检查 WAN 服务和浏览器登录" : "ModelScope 账号暂不可用"), windows: [] }
         if (typeof profile.balance !== "number" || !Number.isFinite(profile.balance)) return { user, error: profile.balance_error || "魔粒余额暂不可用", windows: [] }
-        return { user, plan: "ModelScope WAN",
+        return { user, plan: "ModelScope VideoGen",
           windows: [{ name: "可用魔粒", balance: profile.balance, unit: "魔粒", display: `${profile.balance} 魔粒` }] }
       },
     },
     provider: { id: PROVIDER, models: async () => ({}) },
     tool: {
-      wan_get_models: tool({ description: "List WAN adapter models, first/last-frame support and validated input limits. Local download success is separate from visual quality acceptance.", args: {},
+      videogen_get_models: tool({ description: "List all ModelScope video adapter models (MiniMax-H3, LTX 2.3, WAN 2.2/2.1), first/last-frame support and validated input limits. Local download success is separate from visual quality acceptance.", args: {},
         execute: (_args, ctx = {}) => request(options, "/v1/models", { signal: ctx.abort }) }),
-      wan_diagnose: tool({ description: "Check plugin/service protocol compatibility, live workers, account sessions, input roots and affected jobs after installation or upgrade.", args: {},
+      videogen_diagnose: tool({ description: "Check plugin/service protocol compatibility, live workers, account sessions, input roots and affected jobs after installation or upgrade.", args: {},
         async execute(_args, ctx = {}) {
           const health = await request(options, "/health", { signal: ctx.abort })
           if (health.protocol_version !== PROTOCOL_VERSION || health.service_version !== PLUGIN_VERSION) return { plugin_version: PLUGIN_VERSION, ...health,
-            compatible: false, action: "Update/restart the WAN service and reload the Magpie plugin." }
+            compatible: false, action: "Update/restart the video service and reload the Magpie plugin." }
           return { plugin_version: PLUGIN_VERSION, ...await request(options, "/v1/diagnostics", { signal: ctx.abort }), compatible: true }
         } }),
-      wan_control_job: tool({ description: "Pause/resume/cancel local unsubmitted queued jobs, or explicitly reassign them to a connected account. Cancel does not cancel a provider generation or just stop watching. Submitted/ambiguous jobs are rejected.",
+      videogen_control_job: tool({ description: "Pause/resume/cancel local unsubmitted queued jobs, or explicitly reassign them to a connected account. Cancel does not cancel a provider generation or just stop watching. Submitted/ambiguous jobs are rejected.",
         args: { job_id: tool.schema.string().min(1), action: tool.schema.enum(["pause", "resume", "cancel", "reassign"]), account: tool.schema.string().optional() },
         execute: ({ job_id, ...body }, ctx = {}) => request(options, `/v1/videos/${encodeURIComponent(job_id)}/control`,
           { method: "POST", body: JSON.stringify(body), signal: ctx.abort }) }),
-      wan_reconcile_job: tool({ description: "Resolve unknown_submission only after checking the original ModelScope account: link its existing provider task ID, OR explicitly confirm no task was created before requeuing. Never guess or automatically retry ambiguous submissions.",
+      videogen_reconcile_job: tool({ description: "Resolve unknown_submission only after checking the original ModelScope account: link its existing provider task ID, OR explicitly confirm no task was created before requeuing. Never guess or automatically retry ambiguous submissions.",
         args: { job_id: tool.schema.string().min(1), provider_task_id: tool.schema.string().min(1).optional(), confirm_no_task: tool.schema.boolean().optional() },
         execute: ({ job_id, ...body }, ctx = {}) => request(options, `/v1/videos/${encodeURIComponent(job_id)}/resolve`,
           { method: "POST", body: JSON.stringify(body), signal: ctx.abort }) }),
-      wan_generate_flf2v: submitTool(options, true, "wan2.1-flf2v-14b", watch),
-      wan_generate_i2v: submitTool(options, false, "wan2.2-i2v-a14b", watch),
-      wan_get_video_status: statusTool(options),
-      wan_get_video_result: resultTool(options),
-      wan_list_video_jobs: listTool(options),
-      wan_get_config: tool({ description: "Show allowed input directories and each local ModelScope account's connection and magicube balance.", args: {},
+      videogen_search_models: tool({ description: "Search official AIGC Checkpoint, LoRA and VAE versions matching a video base model. Returns version IDs, trigger words and pagination.",
+        args: { model: tool.schema.string(), model_type: tool.schema.enum(["Checkpoint", "LoRA", "VAE"]).optional(), query: tool.schema.string().max(200).optional(),
+          page: tool.schema.number().int().min(1).optional(), page_size: tool.schema.number().int().min(1).max(50).optional(), account: tool.schema.string().optional() },
+        execute: (args, ctx = {}) => request(options, "/v1/models/search", {method: "POST", body: JSON.stringify(args), signal: ctx.abort}) }),
+      videogen_estimate: tool({ description: "Get an official magicube quote without uploading frames or submitting a task. Same parameters as generation; choose mode i2v or t2v.",
+        args: { ...generateArgs(false, "minimax-h3"), mode: tool.schema.enum(["i2v", "t2v"]).optional(), last_frame: tool.schema.string().optional() },
+        execute: (args, ctx = {}) => request(options, "/v1/videos/estimate", { method: "POST", body: JSON.stringify({ ...args, model: args.model || "minimax-h3", mode: args.mode || (args.first_frame ? "i2v" : "t2v") }), signal: ctx.abort }) }),
+      videogen_generate_t2v: submitTool(options, false, "minimax-h3", watch, true),
+      videogen_generate_flf2v: submitTool(options, true, "wan2.1-flf2v-14b", watch),
+      videogen_generate_i2v: submitTool(options, false, "wan2.2-i2v-a14b", watch),
+      videogen_get_video_status: statusTool(options),
+      videogen_get_video_result: resultTool(options),
+      videogen_list_video_jobs: listTool(options),
+      videogen_get_config: tool({ description: "Show allowed input directories and each local ModelScope account's connection and magicube balance.", args: {},
         async execute(_args, ctx = {}) { const [media, accounts] = await Promise.all([
           request(options, "/v1/media/roots", { signal: ctx.abort }), request(options, "/v1/accounts", { signal: ctx.abort }),
         ]); return { ...media, ...accounts, usage_unit: "魔粒",
           routing: options.routing || "balanced", preferred_account: options.preferredAccount,
+          generation_defaults: { accelerate_lora: { "minimax-h3": true, other_models: false }, accelerated_steps: 4, add_watermark: false },
           routing_modes: { preferred: "首选账号", balanced: "均衡负载：剩余魔粒最多优先，余额相同选队列最短" } } } }),
-      wan_prepare_frames: tool({ description: "Validate frame paths before submitting; explicitly enable copying images outside allowed directories.",
+      videogen_prepare_frames: tool({ description: "Validate frame paths before submitting; explicitly enable copying images outside allowed directories.",
         args: { first_frame: tool.schema.string().min(1), last_frame: tool.schema.string().optional(), copy_to_media_root: tool.schema.boolean().optional() },
         execute: (args, ctx = {}) => prepareFrames(args, options, ctx.abort) }),
     },
@@ -454,4 +485,4 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
 }
 
 // Export the same function so Magpie's loader runs it only once.
-export default MagpieWanTools
+export default MagpieVideoGenTools

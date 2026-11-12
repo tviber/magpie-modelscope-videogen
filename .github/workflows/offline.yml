@@ -46,7 +46,7 @@ jobs:
           npm = 'npm.cmd' if os.name == 'nt' else 'npm'
           subprocess.run([npm, 'install', '--ignore-scripts', '--no-audit', '--no-fund',
                           '--cache', str(temp / 'cache'), str(archive)], cwd=temp, check=True)
-          package = temp / 'node_modules/magpie-modelscope-wan'
+          package = temp / 'node_modules/magpie-modelscope-videogen'
           with open(os.environ['GITHUB_ENV'], 'a') as env:
               env.write('WAN_TEST_PLUGIN=' + (package / 'index.mjs').as_uri() + '\n')
               env.write('WAN_PACKAGED_SOURCE=' + str(package) + '\n')

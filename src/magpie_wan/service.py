@@ -42,7 +42,17 @@ MODEL_IDS = {
     "wan2.1-flf2v-14b": "WAN_VIDEO_2_1_FLF2V_14_B",
     "wan2.2-i2v-a14b": "WAN_VIDEO_2_2_I2V_A_14_B",
     "wan2.2-ti2v-5b": "WAN_VIDEO_2_2_TI2V_5_B",
+    "minimax-h3": "MINIMAX_H3",
+    "ltx-2.3": "LTX_VIDEO_2_3",
+    "wan2.2-t2v-a14b": "WAN_VIDEO_2_2_T2V_A_14_B",
+    "wan2.1-t2v-1.3b": "WAN_VIDEO_2_1_T2V_1_3_B",
+    "wan2.1-t2v-14b": "WAN_VIDEO_2_1_T2V_14_B",
+    "wan2.1-i2v-14b": "WAN_VIDEO_2_1_I2V_14_B",
 }
+LAST_FRAME_MODELS = {DEFAULT_MODEL, "minimax-h3", "ltx-2.3"}
+TEXT_MODELS = {"minimax-h3", "ltx-2.3", "wan2.2-ti2v-5b", "wan2.2-t2v-a14b",
+               "wan2.1-t2v-1.3b", "wan2.1-t2v-14b"}
+IMAGE_MODELS = set(MODEL_IDS) - {"wan2.2-t2v-a14b", "wan2.1-t2v-1.3b", "wan2.1-t2v-14b"}
 MODEL_ALIASES = {**MODEL_IDS, **{value: value for value in MODEL_IDS.values()}}
 MAX_BODY_BYTES = 64 * 1024
 MAX_FRAME_BYTES = 30 * 1024 * 1024
@@ -52,7 +62,7 @@ MAX_DURATION_SECONDS = 10
 MAX_PROJECT_CHARS = 160
 TERMINAL_PROVIDER_STATES = {"SUCCEED", "FAILED", "CANCELED"}
 ACTIVE_STATES = ("queued", "uploading", "submitting", "in_progress", "download_pending", "unknown_submission", "paused")
-PROTOCOL_VERSION = 2
+PROTOCOL_VERSION = 3
 PUBLIC_STATUS = {
     "queued": "queued",
     "uploading": "in_progress",
@@ -197,8 +207,8 @@ def _parse_size(value):
     if not match:
         raise ServiceError("size must be written as WIDTHxHEIGHT, such as '1280x720'")
     width, height = map(int, match.groups())
-    if not (256 <= width <= 1280 and 256 <= height <= 1280):
-        raise ServiceError("width and height must each be between 256 and 1280")
+    if not (256 <= width <= 1536 and 256 <= height <= 1536):
+        raise ServiceError("width and height must each be between 256 and 1536")
     if width % 16 or height % 16:
         raise ServiceError("width and height must be multiples of 16")
     return width, height
@@ -257,7 +267,7 @@ def _validate_frame(value, roots):
 
 
 def _fingerprint(first_frame, last_frame, prompt, model, seconds, width, height, style, negative_prompt, seed,
-                 project=None, shot=None, account=None, routing=None, preferred_account=None):
+                 project=None, shot=None, account=None, routing=None, preferred_account=None, generation_params=None):
     digest = hashlib.sha256()
     for image_path in (first_frame, last_frame):
         content = b"" if image_path is None else Path(image_path).read_bytes()
@@ -278,6 +288,8 @@ def _fingerprint(first_frame, last_frame, prompt, model, seconds, width, height,
                        ("routing", routing), ("preferred_account", preferred_account)):
         if value is not None:
             fields[key] = value
+    if generation_params:
+        fields["generation_params"] = generation_params
     digest.update(json.dumps(fields, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode())
     return "sha256:" + digest.hexdigest()
 
@@ -364,7 +376,7 @@ class JobStore:
             for name, kind in (("shot", "TEXT"), ("input_metadata", "TEXT"),
                                ("last_polled_at", "REAL"), ("started_at", "REAL"),
                                ("completed_at", "REAL"), ("submitted_at", "REAL"),
-                               ("failure_details", "TEXT")):
+                               ("failure_details", "TEXT"), ("generation_params", "TEXT")):
                 if name not in columns:
                     db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
             db.execute("CREATE INDEX IF NOT EXISTS jobs_project ON jobs(project, created_at)")
@@ -646,6 +658,46 @@ class WanService:
             )
 
     @staticmethod
+    def _generation_params(body, model=None):
+        result = {}
+        for name, default in (("accelerate_lora", model == "minimax-h3"), ("add_watermark", False)):
+            value = body.get(name, default)
+            if not isinstance(value, bool):
+                raise ServiceError(f"{name} must be a boolean")
+            result[name] = value
+        for name in ("checkpoint_version_id", "vae_version_id", "num_inference_steps"):
+            value = body.get(name)
+            if value is not None:
+                if not isinstance(value, int) or isinstance(value, bool) or value < 1 or (name == "num_inference_steps" and value > 50):
+                    raise ServiceError(f"{name} must be a positive integer" + (" from 1 to 50" if name == "num_inference_steps" else ""))
+                result[name] = value
+        value = body.get("guidance_scale")
+        if value is not None:
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or not 1.5 <= value <= 20:
+                raise ServiceError("guidance_scale must be from 1.5 to 20")
+            result["guidance_scale"] = value
+        if result["accelerate_lora"] and "num_inference_steps" in result and result["num_inference_steps"] != 4:
+            raise ServiceError("accelerate_lora uses 4 steps; disable it to set num_inference_steps")
+        loras = body.get("loras", [])
+        if not isinstance(loras, list) or len(loras) > 6:
+            raise ServiceError("loras must be a list of at most 6 entries")
+        clean, seen = [], set()
+        for entry in loras:
+            if not isinstance(entry, dict) or set(entry) - {"model_version_id", "scale", "trigger_words"}:
+                raise ServiceError("LoRA entries accept model_version_id, scale and trigger_words")
+            version, scale, words = entry.get("model_version_id"), entry.get("scale", 1), entry.get("trigger_words", [])
+            if isinstance(version, bool) or not isinstance(version, int) or version < 1 or version in seen:
+                raise ServiceError("LoRA model_version_id must be a unique positive integer")
+            if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale) or not -10 <= scale <= 10:
+                raise ServiceError("LoRA scale must be from -10 to 10")
+            if not isinstance(words, list) or len(words) > 32 or any(not isinstance(w, str) or len(w) > 1000 for w in words):
+                raise ServiceError("LoRA trigger_words must contain at most 32 strings of at most 1000 characters")
+            seen.add(version)
+            clean.append({"model_version_id": version, "scale": scale, "trigger_words": words})
+        result["loras"] = clean
+        return result
+
+    @staticmethod
     def _normalize_model(model):
         if isinstance(model, str) and "/" in model:
             model = model.rsplit("/", 1)[-1]
@@ -709,7 +761,7 @@ class WanService:
         with self._submit_lock:
             return self._submit(body, idempotency_header)
 
-    def _submit(self, body, idempotency_header=None):
+    def _submit(self, body, idempotency_header=None, *, quote_only=False):
         if not isinstance(body, dict):
             raise ServiceError("request body must be a JSON object")
         prompt = body.get("prompt")
@@ -740,24 +792,32 @@ class WanService:
                                                preferred_account not in self.accounts):
             raise ServiceError("preferred_account must be one of the configured account IDs")
 
+        model = self._normalize_model(body.get("model", DEFAULT_MODEL))
+        mode = body.get("mode", "i2v")
+        if mode not in ("i2v", "t2v"):
+            raise ServiceError("mode must be i2v or t2v")
+        if mode == "t2v" and model not in TEXT_MODELS:
+            raise ServiceError("this model does not support text-to-video")
+        if mode == "i2v" and model not in IMAGE_MODELS:
+            raise ServiceError("this model requires text-to-video mode")
         first_value = body.get("first_frame", body.get("image"))
-        if first_value is None:
-            raise ServiceError("first_frame is required; use an absolute local image path")
-        first_path, source_w, source_h = _validate_frame(first_value, self.media_roots)
         last_value = body.get("last_frame")
-        last_path = None
-        if last_value is not None:
-            last_path, last_w, last_h = _validate_frame(last_value, self.media_roots)
-            if abs(last_w / last_h - source_w / source_h) > 0.015:
-                raise ServiceError("first_frame and last_frame must have matching aspect ratios")
-
-        size = _parse_size(body.get("size"))
-        if size is None:
-            width, height = _infer_dimensions(first_path)
+        first_path = last_path = None
+        if mode == "t2v":
+            if first_value is not None or last_value is not None:
+                raise ServiceError("text-to-video does not accept input frames")
+            width, height = _parse_size(body.get("size")) or (1280, 720)
         else:
-            width, height = size
-        if abs(width / height - source_w / source_h) > 0.015:
-            raise ServiceError("size must preserve the first frame's aspect ratio")
+            if first_value is None:
+                raise ServiceError("first_frame is required; use an absolute local image path")
+            first_path, source_w, source_h = _validate_frame(first_value, self.media_roots)
+            if last_value is not None:
+                last_path, last_w, last_h = _validate_frame(last_value, self.media_roots)
+                if abs(last_w / last_h - source_w / source_h) > 0.015:
+                    raise ServiceError("first_frame and last_frame must have matching aspect ratios")
+            width, height = _parse_size(body.get("size")) or _infer_dimensions(first_path)
+            if abs(width / height - source_w / source_h) > 0.015:
+                raise ServiceError("size must preserve the first frame's aspect ratio")
 
         duration_value = body.get("seconds", body.get("duration", 5))
         if isinstance(duration_value, bool):
@@ -769,9 +829,8 @@ class WanService:
         if not duration_float.is_integer() or not 1 <= duration_float <= MAX_DURATION_SECONDS:
             raise ServiceError("seconds must be a whole number from 1 to 10")
         seconds = int(duration_float)
-        model = self._normalize_model(body.get("model", DEFAULT_MODEL))
-        if last_path is not None and model != DEFAULT_MODEL:
-            raise ServiceError("last_frame is currently supported only by wan2.1-flf2v-14b")
+        if last_path is not None and model not in LAST_FRAME_MODELS:
+            raise ServiceError("last_frame is supported only by wan2.1-flf2v-14b, minimax-h3 and ltx-2.3")
         style = body.get("style")
         negative_prompt = body.get("negative_prompt")
         for name, value in (("style", style), ("negative_prompt", negative_prompt)):
@@ -782,6 +841,12 @@ class WanService:
         seed = body.get("seed", -1)
         if not isinstance(seed, int) or isinstance(seed, bool) or seed < -1 or seed > 2_147_483_647:
             raise ServiceError("seed must be -1 or a non-negative 32-bit integer")
+        generation_params = self._generation_params(body, model)
+        generation_params["mode"] = mode
+        if quote_only:
+            return {"model": model, "prompt": prompt, "seconds": seconds, "width": width, "height": height,
+                    "style": style, "negative_prompt": negative_prompt, "seed": seed,
+                    "generation_params": generation_params, "account": requested_account}
         supplied_metadata = body.get("input_metadata") or {}
         if not isinstance(supplied_metadata, dict):
             raise ServiceError("input_metadata must be an object")
@@ -792,11 +857,18 @@ class WanService:
             idempotency_key = idempotency_key.strip()
 
         fingerprint = _fingerprint(first_path, last_path, prompt, model, seconds, width, height,
-                                   style, negative_prompt, seed, project, shot, requested_account, routing, preferred_account)
+                                   style, negative_prompt, seed, project, shot, requested_account, routing, preferred_account, generation_params)
         previous = self.store.get_by_idempotency(idempotency_key)
         if previous:
             if previous["input_fingerprint"] != fingerprint:
-                raise ServiceError("idempotency key was already used for different input", 409, "idempotency_conflict")
+                # A retry of a pre-VideoGen request must still return its old job
+                # even though new requests now have explicit generation defaults.
+                advanced = {"mode", "accelerate_lora", "num_inference_steps", "guidance_scale", "loras",
+                            "checkpoint_version_id", "vae_version_id", "add_watermark"}
+                legacy = _fingerprint(first_path, last_path, prompt, model, seconds, width, height,
+                                      style, negative_prompt, seed, project, shot, requested_account, routing, preferred_account)
+                if previous.get("generation_params") or advanced.intersection(body) or previous["input_fingerprint"] != legacy:
+                    raise ServiceError("idempotency key was already used for different input", 409, "idempotency_conflict")
             return previous, False
 
         job_id = "wan_" + uuid.uuid4().hex
@@ -804,16 +876,18 @@ class WanService:
         input_dir = job_dir / "inputs"
         job_dir.mkdir(mode=0o700)
         input_dir.mkdir(mode=0o700)
-        first_copy = input_dir / ("first" + (first_path.suffix.lower() or ".img"))
-        shutil.copyfile(first_path, first_copy)
-        first_copy.chmod(0o600)
+        first_copy = None
+        if first_path:
+            first_copy = input_dir / ("first" + (first_path.suffix.lower() or ".img"))
+            shutil.copyfile(first_path, first_copy)
+            first_copy.chmod(0o600)
         last_copy = None
         if last_path is not None:
             last_copy = input_dir / ("last" + (last_path.suffix.lower() or ".img"))
             shutil.copyfile(last_path, last_copy)
             last_copy.chmod(0o600)
         stored_fingerprint = _fingerprint(first_copy, last_copy, prompt, model, seconds, width, height,
-                                          style, negative_prompt, seed, project, shot, requested_account, routing, preferred_account)
+                                          style, negative_prompt, seed, project, shot, requested_account, routing, preferred_account, generation_params)
 
         eligible = [a for a in self.accounts if a not in self._pending_accounts
                     and not self.logins.is_active(a)]
@@ -848,7 +922,7 @@ class WanService:
                 # ModelScope reports the actual available wallet balance.
                 account = min(available, key=lambda a: (-profiles[a]["balance"], counts[a], a))
         input_metadata = {}
-        for role, path, w, h in (("first_frame", first_path, source_w, source_h),
+        for role, path, w, h in (("first_frame", first_path, source_w if first_path else None, source_h if first_path else None),
                                  ("last_frame", last_path, last_w if last_path else None,
                                   last_h if last_path else None)):
             if path:
@@ -864,7 +938,7 @@ class WanService:
             "created_at": now,
             "updated_at": now,
             "prompt": prompt,
-            "first_frame": self.store.relative_data_path(first_copy),
+            "first_frame": self.store.relative_data_path(first_copy) if first_copy else "",
             "last_frame": self.store.relative_data_path(last_copy) if last_copy else None,
             "model": model,
             "seconds": seconds,
@@ -879,6 +953,7 @@ class WanService:
             "project": project,
             "shot": shot,
             "input_metadata": json.dumps(input_metadata, ensure_ascii=False),
+            "generation_params": json.dumps(generation_params, ensure_ascii=False),
         }
         try:
             self.store.insert(row)
@@ -1010,6 +1085,7 @@ class WanService:
                 result["spec_warnings"].append(
                     f"Requested {job['width']}x{job['height']}; actual {actual['width']}x{actual['height']}. Review cropping or padding.")
         result["prompt"] = job["prompt"]
+        result["generation_params"] = json.loads(job.get("generation_params") or "{}")
         result["style"] = job.get("style")
         result["negative_prompt"] = job.get("negative_prompt")
         metadata = json.loads(job.get("input_metadata") or "{}")
@@ -1087,12 +1163,50 @@ class WanService:
         successes = {r["model"]: r["last_success"] for r in rows}
         return {"object": "list", "data": [
             {"id": alias, "object": "model", "created": 0, "owned_by": "modelscope", "kind": "video",
-             "first_frame_required": True, "last_frame_supported": alias == DEFAULT_MODEL,
+             "first_frame_required": alias not in TEXT_MODELS, "image_to_video_supported": alias in IMAGE_MODELS,
+             "text_to_video_supported": alias in TEXT_MODELS, "last_frame_supported": alias in LAST_FRAME_MODELS,
+             "acceleration_default": alias == "minimax-h3", "acceleration_steps": 4,
+             "generation_parameters": ["accelerate_lora", "num_inference_steps", "guidance_scale", "loras",
+                                       "checkpoint_version_id", "vae_version_id", "add_watermark", "seed", "negative_prompt"],
              "seconds": {"min": 1, "max": MAX_DURATION_SECONDS},
-             "dimensions": {"min": 256, "max": 1280, "multiple_of": 16, "preserve_aspect_ratio": True},
+             "dimensions": {"min": 256, "max": 1536, "multiple_of": 16, "preserve_aspect_ratio": True},
              "limits_source": "adapter_validation_not_live_provider_guarantee",
              "provider_verified_at": None, "last_local_download_success_at": successes.get(alias),
              "quality_acceptance": "not_evaluated"} for alias in MODEL_IDS]}
+
+    def provider_query(self, body, *, catalog=False):
+        """Short read/quote operations, serialized with the original account worker."""
+        account = body.get("account") or next((a for a in self.accounts
+                                              if self.account_snapshot(a)["status"] == "connected"), None)
+        if account not in self.accounts or self.logins.is_active(account):
+            raise ServiceError("No connected ModelScope account is available", 409)
+        lock = self._account_operations[account]
+        if not lock.acquire(timeout=1):
+            raise ServiceError("Account is busy uploading/submitting; retry shortly", 409)
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as playwright:
+                ms = ms_provider.connect(playwright, self.account_urls[account])
+                self.store.verify_identity(account, ms.identity())
+                if catalog:
+                    model = self._normalize_model(body.get("model", "minimax-h3"))
+                    kind = body.get("model_type", "LoRA")
+                    query = body.get("query", "")
+                    page, count = body.get("page", 1), body.get("page_size", 16)
+                    if kind not in ("Checkpoint", "LoRA", "VAE") or not isinstance(query, str) or len(query) > 200:
+                        raise ServiceError("Invalid model_type or query")
+                    if any(isinstance(v, bool) or not isinstance(v, int) for v in (page, count)) or not 1 <= page <= 10000 or not 1 <= count <= 50:
+                        raise ServiceError("page must be positive; page_size must be from 1 to 50")
+                    return ms.catalog(MODEL_IDS[model], kind, query, page, count)
+                spec = self._submit(body, quote_only=True)
+                request = ms.request(MODEL_IDS[spec["model"]], None, None, spec["prompt"], spec["seconds"],
+                                     width=spec["width"], height=spec["height"], style=spec["style"],
+                                     negative_prompt=spec["negative_prompt"], seed=spec["seed"], **spec["generation_params"])
+                return {"estimate": ms.estimate(request), "estimate_unit": "魔粒", "account_id": account,
+                        "model": spec["model"], "generation_params": spec["generation_params"],
+                        "estimate_kind": "estimated_cost_not_duration_or_final_charge", "submitted": False}
+        finally:
+            lock.release()
 
     def resolve_unknown_submission(self, job_id, body):
         job = self.store.get(job_id)
@@ -1325,14 +1439,15 @@ class WanService:
         self.store.update(job["id"], status="uploading", started_at=time.time(), error=None)
         stage = "upload"
         try:
-            start_frame = self.store.resolve_data_path(job["first_frame"])
+            start_frame = self.store.resolve_data_path(job["first_frame"]) if job["first_frame"] else None
             end_frame = self.store.resolve_data_path(job["last_frame"]) if job["last_frame"] else None
-            start_url = ms.upload(start_frame, job["width"], job["height"])
+            start_url = ms.upload(start_frame, job["width"], job["height"]) if start_frame else None
             end_url = ms.upload(end_frame, job["width"], job["height"]) if end_frame else None
             stage = "request"
             request = ms.request(MODEL_IDS[job["model"]], start_url, end_url, job["prompt"], job["seconds"],
                                  width=job["width"], height=job["height"], style=job["style"],
-                                 negative_prompt=job["negative_prompt"], seed=job["seed"])
+                                 negative_prompt=job["negative_prompt"], seed=job["seed"],
+                                 **json.loads(job.get("generation_params") or "{}"))
             stage = "estimate"
             self.store.record_event(job["id"], "estimating")
             estimate = ms.estimate(request)
@@ -1565,10 +1680,12 @@ def make_handler(service, token=None):
             if path == "/v1/accounts/new":
                 return self._json(410, _error_payload("Use /v1/logins to verify login before saving an account."))
             is_submit = path == "/v1/videos"
+            is_quote = path == "/v1/videos/estimate"
+            is_catalog = path == "/v1/models/search"
             is_validate = path == "/v1/frames/validate"
             is_resolve = len(parts) == 4 and parts[:2] == ["v1", "videos"] and parts[3] == "resolve"
             is_control = len(parts) == 4 and parts[:2] == ["v1", "videos"] and parts[3] == "control"
-            if not is_submit and not is_resolve and not is_validate and not is_control:
+            if not is_submit and not is_resolve and not is_validate and not is_control and not is_quote and not is_catalog:
                 return self._json(404, _error_payload("Route not found.", "not_found_error"))
             if not self._check_auth():
                 return
@@ -1579,6 +1696,8 @@ def make_handler(service, token=None):
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise ServiceError("request body must be a JSON object")
+                if is_quote or is_catalog:
+                    return self._json(200, service.provider_query(body, catalog=is_catalog))
                 if is_submit:
                     job, created = service.submit(body, self.headers.get("Idempotency-Key"))
                     result = service.public_job(job)

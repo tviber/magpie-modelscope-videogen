@@ -105,6 +105,42 @@ def test_modelscope_request_sends_prompt_verbatim_unless_style_is_explicit():
     assert request["extraImageInputFrontArgs"]["image"] == "last-url"
 
 
+@pytest.mark.parametrize("model", ["minimax-h3", "MINIMAX_H3"])
+@pytest.mark.parametrize("use_last", [False, True])
+def test_minimax_queues_uploads_and_submits_through_existing_worker(tmp_path, model, use_last):
+    from unittest.mock import Mock
+
+    frame = make_frame(tmp_path / "first.png")
+    service = make_service(tmp_path)
+    body = {"model": model, "prompt": "roll slowly", "first_frame": str(frame), "seconds": 3}
+    if use_last:
+        body["last_frame"] = str(frame)
+    job, _ = service.submit(body)
+    assert job["model"] == "minimax-h3"
+    client = Mock()
+    client.upload.side_effect = ["first-url", "last-url"] if use_last else ["first-url"]
+    client.request.return_value = {"model": "H3-request"}
+    client.estimate.return_value = 68
+    client.submit.return_value = "h3-task"
+    service._submit_job(client, job)
+    saved = service.store.get(job["id"])
+    assert saved["status"] == "in_progress"
+    assert saved["provider_task_id"] == "h3-task"
+    assert service.public_job(saved)["estimate"] == 68
+    assert client.request.call_args.args[:3] == ("MINIMAX_H3", "first-url", "last-url" if use_last else None)
+    client.submit.assert_called_once_with({"model": "H3-request"})
+    service.stop()
+
+
+def test_wan_i2v_still_rejects_last_frame(tmp_path):
+    frame = make_frame(tmp_path / "first.png")
+    service = make_service(tmp_path)
+    with pytest.raises(ServiceError, match="last_frame"):
+        service.submit({"model": "wan2.2-i2v-a14b", "prompt": "move", "first_frame": str(frame),
+                        "last_frame": str(frame)})
+    service.stop()
+
+
 def test_public_job_uses_generic_account_label_and_no_local_path(tmp_path):
     frame = make_frame(tmp_path / "first.png")
     service = make_service(tmp_path)
@@ -795,18 +831,101 @@ def test_models_diagnostics_and_control_http_authentication(tmp_path):
     headers = {'Authorization': 'Bearer private'}
     try:
         assert requests.get(base+'/v1/diagnostics', timeout=3).status_code == 401
+        for route in ('/v1/videos/estimate', '/v1/models/search'):
+            assert requests.post(base+route, json={}, timeout=3).status_code == 401
         assert requests.post(base+f'/v1/videos/{job["id"]}/control', json={'action': 'cancel'}, timeout=3).status_code == 401
         health = requests.get(base+'/v1/diagnostics', headers=headers, timeout=3).json()
         assert health['protocol_version'] == PROTOCOL_VERSION
         assert health['affected_jobs'][0]['id'] == job['id']
         models = requests.get(base+'/v1/models', headers=headers, timeout=3).json()['data']
-        assert len(models) == 3
+        assert len(models) == 9
         assert models[2]['id'] == 'wan2.2-ti2v-5b'
         assert not models[2]['last_frame_supported']
         assert models[2]['provider_verified_at'] is None
         assert models[2]['quality_acceptance'] == 'not_evaluated'
+        assert models[3]['id'] == 'minimax-h3'
+        assert models[3]['last_frame_supported']
         result = requests.post(base+f'/v1/videos/{job["id"]}/control', headers=headers,
                                json={'action': 'pause'}, timeout=3)
         assert result.status_code == 200 and result.json()['status'] == 'paused'
     finally:
         server.shutdown(); thread.join(timeout=3); server.server_close(); service.stop()
+
+@pytest.mark.parametrize('model', ['minimax-h3', 'ltx-2.3', 'wan2.2-ti2v-5b', 'wan2.2-t2v-a14b', 'wan2.1-t2v-14b', 'wan2.1-t2v-1.3b'])
+def test_text_to_video_without_frames_survives_restart(tmp_path, model):
+    import json
+    service = make_service(tmp_path)
+    job, _ = service.submit({'mode': 't2v', 'model': model, 'prompt': 'a ball rolls', 'size': '1280x720'})
+    assert job['first_frame'] == '' and job['last_frame'] is None
+    assert json.loads(job['generation_params'])['mode'] == 't2v'
+    assert service.public_job(job)['input_frames'] == []
+    service.stop()
+    restarted = make_service(tmp_path)
+    assert restarted.store.get(job['id'])['model'] == model
+    restarted.stop()
+
+
+def test_parameters_persist_affect_idempotency_and_reach_provider(tmp_path):
+    import json
+    from unittest.mock import Mock
+    service = make_service(tmp_path)
+    frame = make_frame(tmp_path / 'first.png')
+    body = {'first_frame': str(frame), 'model': 'ltx-2.3', 'prompt': 'dance', 'idempotency_key': 'params',
+            'accelerate_lora': False, 'num_inference_steps': 25, 'guidance_scale': 4,
+            'checkpoint_version_id': 1234, 'vae_version_id': 5678, 'add_watermark': True,
+            'loras': [{'model_version_id': 999, 'scale': .75, 'trigger_words': ['motion']}]}
+    job, _ = service.submit(body)
+    assert service.submit(body)[1] is False
+    with pytest.raises(ServiceError, match='different input'):
+        service.submit({**body, 'num_inference_steps': 26})
+    client = Mock()
+    client.estimate.return_value = 10
+    client.submit.return_value = 'task'
+    service._submit_job(client, job)
+    for name in ('loras', 'guidance_scale', 'num_inference_steps', 'checkpoint_version_id', 'vae_version_id', 'add_watermark'):
+        assert client.request.call_args.kwargs[name] == body[name]
+    assert service.public_job(job)['generation_params']['loras'] == body['loras']
+    # Legacy queued records retain the old no-acceleration call shape.
+    service.store.update(job['id'], generation_params=None)
+    service._submit_job(client, service.store.get(job['id']))
+    assert 'accelerate_lora' not in client.request.call_args.kwargs
+    service.stop()
+
+
+@pytest.mark.parametrize('params', [
+    {'accelerate_lora': 'yes'}, {'accelerate_lora': True, 'num_inference_steps': 20},
+    {'guidance_scale': float('nan')}, {'num_inference_steps': 51}, {'vae_version_id': True},
+    {'loras': [{'model_version_id': 1, 'scale': float('inf')}]},
+    {'loras': [{'model_version_id': 1}, {'model_version_id': 1}]},
+    {'loras': [{'model_version_id': 1, 'unexpected': 'field'}]},
+])
+def test_invalid_generation_parameters_are_rejected_before_queue(tmp_path, params):
+    service = make_service(tmp_path)
+    with pytest.raises(ServiceError):
+        service.submit({'mode': 't2v', 'model': 'minimax-h3', 'prompt': 'motion', **params})
+    assert service.store.list_jobs() == []
+    service.stop()
+
+
+def test_quote_validation_creates_no_job_or_upload(tmp_path):
+    service = make_service(tmp_path)
+    spec = service._submit({'mode': 't2v', 'model': 'minimax-h3', 'prompt': 'motion'}, quote_only=True)
+    assert spec['generation_params']['accelerate_lora'] is True
+    assert service.store.list_jobs() == []
+    assert not list(service.store.jobs_dir.iterdir())
+    service.stop()
+
+
+def test_old_idempotency_keys_return_original_jobs_after_upgrade(tmp_path):
+    from magpie_wan.service import _fingerprint
+    service = make_service(tmp_path)
+    frame = make_frame(tmp_path / 'first.png')
+    body = {'prompt': 'move', 'first_frame': str(frame), 'idempotency_key': 'legacy'}
+    job, _ = service.submit(body)
+    legacy_hash = _fingerprint(frame, None, 'move', job['model'], job['seconds'], job['width'], job['height'], None, None, -1)
+    service.store.update(job['id'], input_fingerprint=legacy_hash, generation_params=None)
+    retried, created = service.submit(body)
+    assert retried['id'] == job['id'] and not created
+    with pytest.raises(ServiceError, match='different input'):
+        service.submit({**body, 'accelerate_lora': True})
+    service.stop()
