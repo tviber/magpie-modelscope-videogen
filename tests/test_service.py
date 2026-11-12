@@ -1,4 +1,5 @@
 import math
+import os
 import sqlite3
 from pathlib import Path
 
@@ -231,7 +232,10 @@ def test_launch_browser_account_persists_new_cdp_profile_and_starts_worker(tmp_p
     assert launches and "--remote-debugging-port=19456" in launches[0][0]
     browser_profile = service.store.data_dir / "browser-profiles" / "account-2"
     assert browser_profile.is_dir()
-    assert browser_profile.stat().st_mode & 0o777 == 0o700
+    # Windows chmod/stat do not implement POSIX owner/group permission bits.
+    # Keep the browser/profile/registry assertions above and below on every OS.
+    if os.name != "nt":
+        assert browser_profile.stat().st_mode & 0o777 == 0o700
     service.stop()
 
     restored = make_service(tmp_path / "first", {"account-1": "http://127.0.0.1:9223"})
