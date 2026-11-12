@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { chmod, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { createServer } from "node:http"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -89,7 +89,7 @@ test("one plugin export and independent account labels and magicube wallets", as
     { id: "a", label: "Alice", status: "connected", balance: 45, stale: false },
     { id: "b", label: "Bob", status: "connected", balance: 0, stale: false },
   ]
-  const { plugin } = await fixture(t, (req, res) => {
+  const { plugin, options } = await fixture(t, (req, res) => {
     if (req.url === "/v1/accounts") return res.end(JSON.stringify({ accounts: profiles }))
     res.end(JSON.stringify(profiles.find(p => req.url.endsWith(`/${p.id}`))))
   }, { testAccounts: true })
@@ -100,7 +100,7 @@ test("one plugin export and independent account labels and magicube wallets", as
   assert.match(plugin.auth.icon, /^data:image\/png;base64,/)
   for (let i = 0; i < profiles.length; i++) {
     process.env.WAN_MAGPIE_CONNECT_ACCOUNT = profiles[i].id
-    const login = await plugin.auth.methods[0].authorize()
+    const login = await (await plugin.auth.methods[0].authorize()).callback()
     delete process.env.WAN_MAGPIE_CONNECT_ACCOUNT
     assert.equal(login.key, profiles[i].id)
     assert.equal(login.metadata.email, `${profiles[i].label} · ${profiles[i].id}`)
@@ -112,7 +112,7 @@ test("one plugin export and independent account labels and magicube wallets", as
   process.env.WAN_MAGPIE_CONNECT_ACCOUNT = "a"
   t.after(() => { delete process.env.WAN_MAGPIE_CONNECT_ACCOUNT })
   profiles[0].stale = true
-  assert.equal((await plugin.auth.methods[0].authorize()).type, "failed")
+  assert.equal((await (await plugin.auth.methods[0].authorize()).callback()).type, "failed")
   assert.deepEqual((await plugin.auth.usage(async () => ({ key: "a" }))).windows, [])
   profiles[1].balance = null
   const unknown = await plugin.auth.usage(async () => ({ key: "b" }))
@@ -123,13 +123,13 @@ test("one plugin export and independent account labels and magicube wallets", as
 test("account connection and usage explain rejected browser sessions", async t => {
   const profile = { id: "a", label: "Alice", status: "unavailable", balance: null, stale: false,
     session_error: "ModelScope rejected this browser session (HTTP 401). Sign in again." }
-  const { plugin } = await fixture(t, (req, res) => {
+  const { plugin, options } = await fixture(t, (req, res) => {
     if (req.url === "/v1/accounts") return res.end(JSON.stringify({ accounts: [profile] }))
     res.end(JSON.stringify(profile))
   }, { testAccounts: true })
   process.env.WAN_MAGPIE_CONNECT_ACCOUNT = "a"
   t.after(() => { delete process.env.WAN_MAGPIE_CONNECT_ACCOUNT })
-  const connect = await plugin.auth.methods[0].authorize()
+  const connect = await (await plugin.auth.methods[0].authorize()).callback()
   assert.equal(connect.type, "failed")
   assert.match(connect.error, /HTTP 401/)
   const usage = await plugin.auth.usage(async () => ({ key: "a" }))
@@ -139,50 +139,57 @@ test("account connection and usage explain rejected browser sessions", async t =
   assert.deepEqual(usage.windows, [])
 })
 
-test("one click discovers fresh accounts and invokes Magpie login only for connected sessions", async t => {
-  if (process.platform === "win32") return t.skip("POSIX CLI fixture; live Magpie login is tested on macOS")
-  const directory = await mkdtemp(join(tmpdir(), "wan-login-"))
-  t.after(() => rm(directory, { recursive: true, force: true }))
-  const executable = join(directory, "magpie")
-  const log = join(directory, "accounts")
-  await writeFile(executable, `#!/bin/sh\n[ "$1" = plugin ] && [ "$2" = login ] && [ "$3" = modelscope-wan ] && [ "$4" = 1 ] || exit 2\nprintf '%s\\n' "$WAN_MAGPIE_CONNECT_ACCOUNT" >> '${log}'\n`)
-  await chmod(executable, 0o700)
-  let profiles = []
-  const { plugin } = await fixture(t, (req, res) => {
-    if (req.url === "/v1/accounts") return res.end(JSON.stringify({ accounts: profiles }))
-    res.end(JSON.stringify(profiles.find(p => req.url.endsWith(`/${p.id}`))))
-  }, { testAccounts: true, magpieExecutable: executable, loginWaitMs: 0 })
+test("native Magpie login only saves the matching verified account after callback", async t => {
+  const id = "a".repeat(48)
+  let state = "waiting", polls = 0
+  const { plugin } = await fixture(t, async (req, res) => {
+    if (req.method === "POST" && req.url === "/v1/logins") {
+      let body = ""
+      for await (const chunk of req) body += chunk
+      assert.deepEqual(JSON.parse(body), {})
+      return res.end(JSON.stringify({ id, account: "account-3" }))
+    }
+    if (req.url === `/v1/logins/${id}`) { polls++; return res.end(JSON.stringify({ id, account: "account-3", state })) }
+    if (req.url === "/v1/accounts/account-3") return res.end(JSON.stringify({
+      id: "account-3", label: "Alice", status: "connected", stale: false,
+    }))
+    res.end("{}")
+  }, { testAccounts: true })
+  const method = plugin.auth.methods[0]
   assert.equal(plugin.auth.methods.length, 1)
-  assert.equal(plugin.auth.methods[0].keyless, true)
-  // Accounts are added after initialization, just as after a browser login.
-  profiles = [
-    { id: "a", label: "Alice", status: "connected", balance: 300, stale: false },
-    { id: "b", label: "Bob", status: "connected", balance: 165, stale: false },
-    { id: "c", status: "unavailable", stale: false },
-    { id: "d", status: "connected", stale: true },
-  ]
-  const result = await plugin.auth.methods[0].authorize()
+  assert.equal(method.label, "登录新账号")
+  assert.equal(method.prompts, undefined)
+  assert.equal(method.ask, undefined)
+  assert.equal(method.type, "oauth")
+  const flow = await method.authorize({ account: "ignored-old-input" })
+  assert.equal(flow.method, "auto")
+  assert.equal(flow.url, "")
+  assert.equal(flow.key, undefined)
+  assert.equal(polls, 0)
+  state = "completed"
+  const result = await flow.callback()
   assert.equal(result.type, "success")
-  assert.equal(result.key, "a")
-  assert.equal(await readFile(log, "utf8"), "a\nb\n")
-  const controller = new AbortController()
-  controller.abort()
-  assert.equal((await plugin.auth.methods[0].authorize(undefined, { signal: controller.signal })).type, "failed")
-  assert.equal(await readFile(log, "utf8"), "a\nb\n")
-  await writeFile(executable, '#!/bin/sh\necho private-child-output >&2\nexit 1\n')
-  const failed = await plugin.auth.methods[0].authorize()
-  assert.equal(failed.type, "failed")
-  assert.ok(!failed.error.includes("private-child-output"))
+  assert.equal(result.key, "account-3")
+  assert.equal(result.metadata.wan_account, "account-3")
+  assert.deepEqual(await flow.callback(), result)
+  assert.equal(polls, 1)
 })
 
-test("login without a verified session explains the browser step and saves nothing", async t => {
-  const { plugin } = await fixture(t, (_req, res) => res.end(JSON.stringify({ accounts: [
-    { id: "a", status: "unavailable", session_error: "HTTP 401" },
-  ] })), { testAccounts: true, loginWaitMs: 0, magpieExecutable: "/does/not/exist" })
-  const result = await plugin.auth.methods[0].authorize()
-  assert.equal(result.type, "failed")
-  assert.match(result.error, /浏览器窗口登录/)
-})
+for (const scenario of ["cancelled", "mismatch", "unverified"]) {
+  test(`native Magpie login rejects ${scenario} and cancels its own task`, async t => {
+    const id = "c".repeat(48)
+    let cancelled = 0
+    const { plugin } = await fixture(t, (req, res) => {
+      if (req.url.endsWith("/cancel")) { cancelled++; return res.end("{}") }
+      if (req.url === "/v1/logins") return res.end(JSON.stringify({ id, account: "a" }))
+      if (req.url === `/v1/logins/${id}`) return res.end(JSON.stringify({ id,
+        account: scenario === "mismatch" ? "b" : "a", state: scenario === "cancelled" ? "cancelled" : "completed" }))
+      res.end(JSON.stringify({ id: "a", status: "unavailable", stale: true }))
+    }, { testAccounts: true })
+    assert.equal((await (await plugin.auth.methods[0].authorize()).callback()).type, "failed")
+    assert.equal(cancelled, 1)
+  })
+}
 
 test("result packages escaped preview, frame provenance, specifications and manifest", async t => {
   const seen = []
@@ -294,4 +301,57 @@ test("completion watcher resumes persisted tasks, downloads once and emits usefu
   assert.match(notifications[0].message, /A steady camera/)
   assert.match(notifications[0].message, /preview.html/)
   assert.deepEqual(saved, [], "completed task must be removed from persisted watch state within 5 seconds")
+})
+
+test("native login uses callback cancellation, not the short-lived authorize signal", async t => {
+  const id = "e".repeat(48)
+  let cancelled = 0
+  const { plugin } = await fixture(t, (req, res) => {
+    if (req.url.endsWith('/cancel')) { cancelled++; return res.end('{}') }
+    if (req.url === '/v1/logins') return res.end(JSON.stringify({ id, account: 'a' }))
+    if (req.url === `/v1/logins/${id}`) return res.end(JSON.stringify({ id, account: 'a', state: 'completed' }))
+    res.end(JSON.stringify({ id: 'a', label: 'Alice', status: 'connected', stale: false }))
+  }, { testAccounts: true })
+  const authorizeController = new AbortController()
+  const flow = await plugin.auth.methods[0].authorize({}, { signal: authorizeController.signal })
+  assert.equal(flow.opened, true)
+  assert.equal(flow.url, '')
+  authorizeController.abort()
+  assert.equal((await flow.callback()).type, 'success')
+  assert.equal(cancelled, 0)
+  const next = await plugin.auth.methods[0].authorize()
+  const callbackController = new AbortController()
+  callbackController.abort()
+  assert.equal((await next.callback(undefined, { signal: callbackController.signal })).type, 'failed')
+  assert.equal(cancelled, 1)
+})
+
+test("CLI account synchronization cannot launch a new browser through native login", async t => {
+  const previous = process.env.WAN_MAGPIE_CONNECT_ACCOUNT
+  process.env.WAN_MAGPIE_CONNECT_ACCOUNT = 'existing'
+  t.after(() => {
+    if (previous === undefined) delete process.env.WAN_MAGPIE_CONNECT_ACCOUNT
+    else process.env.WAN_MAGPIE_CONNECT_ACCOUNT = previous
+  })
+  let launches = 0
+  const { plugin } = await fixture(t, (req, res) => {
+    if (req.url === '/v1/logins') launches++
+    res.end(JSON.stringify({ id: 'existing', status: 'connected', stale: false, label: 'Existing' }))
+  }, { testAccounts: true })
+  const flow = await plugin.auth.methods[0].authorize()
+  assert.equal((await flow.callback()).key, 'existing')
+  assert.equal(launches, 0)
+})
+
+test("repeat login saves verified original account while retaining task correlation", async t => {
+  const id = 'f'.repeat(48)
+  const { plugin } = await fixture(t, (req, res) => {
+    if (req.url === '/v1/logins') return res.end(JSON.stringify({ id, account: 'new' }))
+    if (req.url === `/v1/logins/${id}`) return res.end(JSON.stringify({ id, account: 'new', result_account: 'old', state: 'completed' }))
+    assert.equal(req.url, '/v1/accounts/old')
+    res.end(JSON.stringify({ id: 'old', label: 'Existing', status: 'connected', stale: false }))
+  }, { testAccounts: true })
+  const result = await (await plugin.auth.methods[0].authorize()).callback()
+  assert.equal(result.type, 'success')
+  assert.equal(result.key, 'old')
 })

@@ -7,8 +7,6 @@ import { basename, isAbsolute, join, relative, sep } from "node:path"
 import { Readable } from "node:stream"
 import { pipeline } from "node:stream/promises"
 import { fileURLToPath, pathToFileURL } from "node:url"
-import { execFile } from "node:child_process"
-import { promisify } from "node:util"
 import { setTimeout as delay } from "node:timers/promises"
 
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
@@ -313,33 +311,7 @@ function completionWatcher(input, options) {
 }
 
 const PROVIDER = "modelscope-wan"
-const exec = promisify(execFile)
 const CONNECT_ACCOUNT_ENV = "WAN_MAGPIE_CONNECT_ACCOUNT"
-
-async function saveMagpieAccount(account, options, signal) {
-  // Use Magpie's public login path so it deduplicates accounts and refreshes
-  // Providers/Usage. Never edit its auth files or call auth.set across scopes.
-  const candidates = options.magpieExecutable ? [options.magpieExecutable] : [
-    "magpie", ...(process.platform === "darwin" ? [
-      "/Applications/magpie.app/Contents/MacOS/magpie",
-      join(homedir(), "Applications/magpie.app/Contents/MacOS/magpie"),
-    ] : []),
-  ]
-  for (const executable of candidates) {
-    try {
-      await exec(executable, ["plugin", "login", PROVIDER, "1"], {
-        env: { ...process.env, [CONNECT_ACCOUNT_ENV]: account },
-        signal, timeout: 30_000, maxBuffer: 1024 * 1024, windowsHide: true,
-      })
-      return
-    } catch (error) {
-      if (error.code === "ENOENT") continue
-      // Child output may contain other providers' configuration. Do not expose it.
-      throw new Error(`账号 ${account} 同步到 Magpie 失败；已同步的账号会保留，请重试。`)
-    }
-  }
-  throw new Error("找不到 Magpie 命令；请将 magpie 加入 PATH，或配置插件的 magpieExecutable 路径。")
-}
 
 export const MagpieWanTools = async (input = {}, options = {}) => {
   const watch = completionWatcher(input, options)
@@ -353,46 +325,6 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
       return { type: "success", key: account, metadata: { email: `${profile.label} · ${account}`, wan_account: account } }
     } catch (error) { return { type: "failed", error: error.message } }
   }
-  const syncAccounts = async (_inputs, { signal } = {}) => {
-    // A child CLI invocation saves one account via the normal host callback.
-    // It must never launch another sync or inherit a stale list of accounts.
-    const childAccount = process.env[CONNECT_ACCOUNT_ENV]
-    if (childAccount) return connectAccount(childAccount, signal)
-    const deadline = AbortSignal.timeout(45_000)
-    const abort = AbortSignal.any([signal, deadline].filter(Boolean))
-    try {
-      let profiles
-      const until = Date.now() + (options.loginWaitMs ?? 20_000)
-      do {
-        profiles = (await request(options, "/v1/accounts", { signal: abort })).accounts || []
-        if (profiles.some(p => p.status === "connected" && !p.stale) || Date.now() >= until) break
-        await delay(1000, undefined, { signal: abort })
-      } while (true)
-      const ready = profiles.filter(p => p.status === "connected" && !p.stale)
-      if (!ready.length) return { type: "failed", error: profiles.length
-        ? "尚未检测到有效登录。请在 WAN 服务配置的浏览器窗口登录 ModelScope 后，再点登录同步。" + (profiles[0].session_error || "")
-        : "WAN 服务没有配置账号，请先配置 WAN_MODELSCOPE_ACCOUNTS。" }
-      for (const profile of ready) {
-        if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(profile.id)) throw new Error("WAN 服务返回了无效的账号 ID")
-      }
-      // Save every account through the CLI, including the first. The outer
-      // success is then deduplicated by Magpie and refreshes the open UI.
-      for (const profile of ready) await saveMagpieAccount(profile.id, options, abort)
-      abort.throwIfAborted()
-      const result = await connectAccount(ready[0].id, abort)
-      if (result.type === "success") {
-        const skipped = profiles.filter(p => !ready.includes(p)).map(p => p.id)
-        await input.client?.tui?.showToast?.({ body: {
-          title: "ModelScope 账号已同步", variant: "success",
-          message: `已同步 ${ready.length} 个账号，可在供应商和用量中查看魔粒余额。` +
-            (skipped.length ? `未同步：${skipped.join("、")}，请登录后重试。` : ""),
-        } })?.catch(() => {})
-      }
-      return result
-    } catch (error) {
-      return { type: "failed", error: abort.aborted ? "登录同步已取消或超时；已同步的账号会保留，可重试。" : error.message }
-    }
-  }
   return {
     config: async cfg => {
       cfg.provider ??= {}
@@ -401,7 +333,60 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
     auth: {
       provider: PROVIDER,
       icon,
-      methods: [{ type: "api", keyless: true, label: "登录并同步浏览器账号", authorize: syncAccounts }],
+      methods: [
+        { type: "oauth", label: "登录新账号",
+          async authorize(inputs, { signal } = {}) {
+            const childAccount = process.env[CONNECT_ACCOUNT_ENV]
+            if (childAccount) return {
+              url: "", opened: true, method: "auto", instructions: "正在同步已验证账号。",
+              callback: (_code, { signal: callbackSignal } = {}) => connectAccount(childAccount, callbackSignal),
+            }
+            const task = await request(options, "/v1/logins", {
+              method: "POST", body: "{}", signal,
+            })
+            if (!/^[a-f0-9]{48}$/.test(task?.id || "")) throw new Error("WAN 服务没有返回有效的登录任务")
+            const cancelTask = () => request(options, `/v1/logins/${task.id}/cancel`, {
+              method: "POST", body: "{}", signal: AbortSignal.timeout(5000),
+            }).catch(() => {})
+            const deadline = AbortSignal.timeout(550_000)
+            let result
+            return {
+              url: "", opened: true, method: "auto",
+              instructions: "请在新打开的 Chrome 窗口完成 ModelScope 短信和拖动验证码。Magpie 会自动等待并保存账号，成功后窗口关闭并转为后台运行。关闭登录窗口可取消，无需复制 Cookie。",
+              callback(_code, { signal: callbackSignal } = {}) {
+                result ??= (async () => {
+                  const abort = AbortSignal.any([callbackSignal, deadline].filter(Boolean))
+                  const onAbort = () => { void cancelTask() }
+                  abort.addEventListener("abort", onAbort, { once: true })
+                  let complete = false
+                  try {
+                    while (true) {
+                      abort.throwIfAborted()
+                      const state = await request(options, `/v1/logins/${task.id}`, { signal: abort })
+                      if (state.id !== task.id || state.account !== task.account) throw new Error("登录任务与账号不匹配")
+                      if (state.state === "completed") {
+                        const connected = await connectAccount(state.result_account || state.account, abort)
+                        complete = connected.type === "success"
+                        return connected
+                      }
+                      if (["failed", "cancelled", "expired"].includes(state.state)) {
+                        return { type: "failed", error: state.error || "登录未完成，请重试。" }
+                      }
+                      await delay(750, undefined, { signal: abort })
+                    }
+                  } catch (error) {
+                    return { type: "failed", error: abort.aborted ? "登录已取消或超时，请重试。" : error.message }
+                  } finally {
+                    abort.removeEventListener("abort", onAbort)
+                    if (!complete) await cancelTask()
+                  }
+                })()
+                return result
+              },
+            }
+          }
+        },
+      ],
       async usage(getAuth, _provider, { signal } = {}) {
         const auth = await getAuth()
         const account = String(auth?.key || "").trim()
@@ -409,7 +394,7 @@ export const MagpieWanTools = async (input = {}, options = {}) => {
         const profile = await request(options, `/v1/accounts/${encodeURIComponent(account)}`, { signal })
         const user = `${profile.label || account} · ${account}`
         if (profile.status !== "connected" || profile.stale) return { user,
-          signIn: profile.session_error ? "expired" : undefined,
+          signIn: profile.session_error && /HTTP 401|rejected/i.test(profile.session_error) ? "expired" : undefined,
           error: profile.session_error || (profile.stale ? "账号状态尚未刷新，请检查 WAN 服务和浏览器登录" : "ModelScope 账号暂不可用"), windows: [] }
         if (typeof profile.balance !== "number" || !Number.isFinite(profile.balance)) return { user, error: profile.balance_error || "魔粒余额暂不可用", windows: [] }
         return { user, plan: "ModelScope WAN", balance: `${profile.balance} 魔粒`,

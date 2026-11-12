@@ -209,6 +209,47 @@ def test_named_account_environment(monkeypatch):
         parse_accounts()
 
 
+def test_launch_browser_account_persists_new_cdp_profile_and_starts_worker(tmp_path, monkeypatch):
+    import magpie_wan.service as wan_service
+
+    browser = tmp_path / "chrome"
+    browser.write_bytes(b"fixture")
+    launches = []
+    monkeypatch.setattr(wan_service, "_browser_executable", lambda: browser)
+    monkeypatch.setattr(wan_service, "_free_cdp_port", lambda: 19456)
+    monkeypatch.setattr(wan_service.subprocess, "Popen", lambda command, **kwargs: launches.append((command, kwargs)))
+    service = make_service(tmp_path / "first", {"account-1": "http://127.0.0.1:9223"})
+    workers = []
+    monkeypatch.setattr(service, "_start_account_worker", workers.append)
+
+    profile = service.launch_browser_account()
+    assert profile["id"] == "account-2"
+    assert profile["status"] == "connecting"
+    assert profile["stale"]
+    assert service.account_urls["account-2"] == "http://127.0.0.1:19456"
+    assert workers == ["account-2"]
+    assert launches and "--remote-debugging-port=19456" in launches[0][0]
+    browser_profile = service.store.data_dir / "browser-profiles" / "account-2"
+    assert browser_profile.is_dir()
+    assert browser_profile.stat().st_mode & 0o777 == 0o700
+    service.stop()
+
+    restored = make_service(tmp_path / "first", {"account-1": "http://127.0.0.1:9223"})
+    assert restored.account_urls["account-2"] == "http://127.0.0.1:19456"
+    assert restored.account_snapshot("account-2")["status"] == "connecting"
+    restored.stop()
+
+
+def test_launch_browser_account_requires_an_installed_browser(tmp_path, monkeypatch):
+    import magpie_wan.service as wan_service
+
+    service = make_service(tmp_path)
+    monkeypatch.setattr(wan_service, "_browser_executable", lambda: None)
+    with pytest.raises(ServiceError, match="Chrome 或 Chromium"):
+        service.launch_browser_account()
+    service.stop()
+
+
 def test_windows_paths_migrate_and_remain_confined(tmp_path):
     service = make_service(tmp_path)
     frame = make_frame(tmp_path / "first.png")
@@ -410,4 +451,72 @@ def test_old_completed_job_specs_are_backfilled_without_changing_completion_time
     monkeypatch.setattr(media, "validate_video_file", lambda _: {"duration": 5.0625, "width": 1280, "height": 736, "fps": 16})
     assert service.job_details(old)["actual"]["fps"] == 16
     assert service.store.get(job["id"])["updated_at"] == old["updated_at"]
+    service.stop()
+
+
+def test_pending_login_is_not_scheduled_or_persisted_and_cancel_closes_browser(tmp_path, monkeypatch):
+    import json
+    from unittest.mock import Mock
+    import magpie_wan.service as module
+    service = make_service(tmp_path)
+    browser = tmp_path / 'chrome'
+    browser.touch()
+    process = Mock()
+    process.poll.return_value = None
+    monkeypatch.setattr(module, '_browser_executable', lambda: browser)
+    monkeypatch.setattr(module, '_free_cdp_port', lambda: 19457)
+    launch = Mock(return_value=process)
+    monkeypatch.setattr(module.subprocess, 'Popen', launch)
+    account = service.launch_browser_account(pending=True)['id']
+    assert '--headless=new' in launch.call_args.args[0]
+    assert json.loads((service.store.data_dir / 'browser-accounts.json').read_text()) == {}
+    frame = make_frame(tmp_path / 'frame.png')
+    with pytest.raises(ServiceError, match='正在登录'):
+        service.submit({'prompt': 'motion', 'first_frame': str(frame), 'account': account})
+    service.discard_pending_account(account)
+    process.terminate.assert_called_once()
+    assert account not in service.accounts
+    assert not (service.store.data_dir / 'browser-profiles' / account).exists()
+    service.stop()
+    restored = make_service(tmp_path)
+    assert account not in restored.accounts
+    restored.stop()
+
+
+def test_managed_restart_reuses_profile_and_stops_owned_browser(tmp_path, monkeypatch):
+    from unittest.mock import Mock
+    import magpie_wan.service as module
+    browser = tmp_path / 'chrome'
+    browser.touch()
+    monkeypatch.setattr(module, '_browser_executable', lambda: browser)
+    ports = iter([19457, 19458])
+    monkeypatch.setattr(module, '_free_cdp_port', lambda: next(ports))
+    processes = [Mock(), Mock()]
+    for process in processes:
+        process.poll.return_value = None
+    launch = Mock(side_effect=processes)
+    monkeypatch.setattr(module.subprocess, 'Popen', launch)
+    service = make_service(tmp_path)
+    monkeypatch.setattr(service, '_start_account_worker', lambda _: None)
+    account = service.launch_browser_account()['id']
+    profile = service.store.data_dir / 'browser-profiles' / account
+    service.stop()
+    processes[0].terminate.assert_called_once()
+    assert profile.exists()
+    restored = make_service(tmp_path)
+    monkeypatch.setattr(restored, '_start_account_worker', lambda _: None)
+    restored.start()
+    assert restored.account_urls[account].endswith(':19458')
+    assert f'--user-data-dir={profile}' in launch.call_args.args[0]
+    restored.stop()
+    processes[1].terminate.assert_called_once()
+
+
+def test_identity_lookup_preserves_unique_binding_and_job_owner(tmp_path):
+    service = make_service(tmp_path, {'old': 'http://127.0.0.1:9223', 'new': 'http://127.0.0.1:9224'})
+    service.store.verify_identity('old', 'Id:123')
+    assert service.store.account_for_identity('Id:123') == 'old'
+    assert service.store.account_for_identity('Id:456') is None
+    with pytest.raises(ServiceError, match='already bound'):
+        service.store.verify_identity('new', 'Id:123')
     service.stop()

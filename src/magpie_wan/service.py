@@ -13,8 +13,10 @@ import math
 import os
 import re
 import shutil
+import socket
 import signal
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -109,6 +111,38 @@ def validate_accounts(accounts):
     if len(set(accounts.values())) != len(accounts):
         raise ServiceError("Account CDP URLs must be unique")
     return accounts
+
+
+def _browser_executable():
+    candidates = []
+    if sys.platform == "darwin":
+        candidates.extend((
+            Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            Path("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+        ))
+    elif os.name == "nt":
+        for variable in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+            base = os.environ.get(variable)
+            if base:
+                candidates.append(Path(base) / "Google/Chrome/Application/chrome.exe")
+                candidates.append(Path(base) / "Chromium/Application/chrome.exe")
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            candidates.append(Path(found))
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _free_cdp_port(start=9223):
+    for port in range(start, min(start + 1000, 65536)):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise ServiceError("No free local browser debugging port is available", 503, "browser_port_unavailable")
 
 
 def parse_media_roots(raw=None):
@@ -338,6 +372,14 @@ class JobStore:
                 raise ServiceError("This ModelScope login is already bound to another account ID",
                                    409, "duplicate_account_identity") from exc
 
+    def account_for_identity(self, identity):
+        """Resolve a verified login without changing any existing job ownership."""
+        with self._connect() as db:
+            salt = db.execute("SELECT value FROM metadata WHERE key='identity_salt'").fetchone()[0]
+            fingerprint = hmac.new(salt.encode(), identity.encode(), hashlib.sha256).hexdigest()
+            row = db.execute("SELECT id FROM accounts WHERE fingerprint=?", (fingerprint,)).fetchone()
+            return row["id"] if row else None
+
     def recover(self):
         now = time.time()
         with self._connect() as db:
@@ -434,6 +476,9 @@ class WanService:
         account_urls = accounts if accounts is not None else parse_accounts()
         if not account_urls:
             raise ServiceError("Configure at least one ModelScope CDP URL")
+        self._startup_accounts = set(account_urls) if isinstance(account_urls, dict) else {
+            ms_provider.account_label(index) for index in range(len(account_urls))
+        }
         self.account_urls = validate_accounts(dict(account_urls) if isinstance(account_urls, dict) else {
             ms_provider.account_label(index): url for index, url in enumerate(account_urls)})
         configured_roots = (tuple(Path(p).expanduser().resolve() for p in media_roots)
@@ -441,6 +486,20 @@ class WanService:
         if not configured_roots:
             raise ServiceError("WAN_MEDIA_ROOTS must contain at least one directory")
         self.store = JobStore(data_dir or default_data_dir())
+        registry_path = self.store.data_dir / "browser-accounts.json"
+        try:
+            saved_accounts = json.loads(registry_path.read_text(encoding="utf-8"))
+            if not isinstance(saved_accounts, dict):
+                raise ServiceError("Saved browser account registry is invalid")
+            for account, url in (validate_accounts(saved_accounts) if saved_accounts else {}).items():
+                if account in self.account_urls and self.account_urls[account] != url:
+                    raise ServiceError(f"Saved browser account conflicts with configured account {account}")
+                self.account_urls.setdefault(account, url)
+        except FileNotFoundError:
+            pass
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ServiceError("Saved browser account registry is invalid") from exc
+        self.account_urls = validate_accounts(self.account_urls)
         lock_path = self.store.data_dir / ".service.lock"
         self._service_lock = lock_path.open("a+b")
         os.chmod(lock_path, 0o600)
@@ -460,6 +519,11 @@ class WanService:
         self.accounts = list(self.account_urls)
         self.account_labels = {account: account for account in self.accounts}
         self._profile_lock = threading.Lock()
+        self._accounts_lock = threading.RLock()
+        self._browser_processes = {}
+        self._browser_modes = {}
+        self._pending_accounts = set()
+        self._account_operations = {account: threading.Lock() for account in self.accounts}
         self.account_profiles = {account: {"id": account, "label": account, "balance": None,
                                           "status": "connecting", "checked_at": None,
                                           "unit": "魔粒", "balance_error": None,
@@ -470,6 +534,8 @@ class WanService:
         self.poll_seconds = max(2, int(poll_seconds))
         self.stop_event = threading.Event()
         self.workers = []
+        from .login import LoginManager
+        self.logins = LoginManager(self)
         self.store.recover()
         missing_accounts = self.store.active_accounts() - set(self.accounts)
         if missing_accounts:
@@ -637,8 +703,13 @@ class WanService:
         stored_fingerprint = _fingerprint(first_copy, last_copy, prompt, model, seconds, width, height,
                                           style, negative_prompt, seed, project, shot, requested_account)
 
-        counts = self.store.active_counts(self.accounts)
-        account = requested_account or min(self.accounts, key=lambda candidate: counts.get(candidate, 0))
+        eligible = [a for a in self.accounts if a not in self._pending_accounts
+                    and not self.logins.is_active(a)]
+        if requested_account and requested_account not in eligible or not requested_account and not eligible:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise ServiceError("账号正在登录，请完成登录后再提交任务。", 409, "account_login_pending")
+        counts = self.store.active_counts(eligible)
+        account = requested_account or min(eligible, key=lambda candidate: counts.get(candidate, 0))
         input_metadata = {}
         for role, path, w, h in (("first_frame", first_path, source_w, source_h),
                                  ("last_frame", last_path, last_w if last_path else None,
@@ -798,13 +869,132 @@ class WanService:
 
     def start(self):
         for account in self.accounts:
+            if account not in self._startup_accounts:
+                self._ensure_managed_browser(account)
+            self._start_account_worker(account)
+
+    def _start_account_worker(self, account):
+        with self._accounts_lock:
+            if any(worker.name == f"wan-worker-{self.account_labels[account]}" and worker.is_alive()
+                   for worker in self.workers):
+                return
             worker = threading.Thread(target=self._worker, args=(account,), daemon=True,
                                       name=f"wan-worker-{self.account_labels[account]}")
             worker.start()
             self.workers.append(worker)
 
+    def _save_browser_accounts(self):
+        registry_path = self.store.data_dir / "browser-accounts.json"
+        saved = {key: value for key, value in self.account_urls.items()
+                 if key not in self._startup_accounts and key not in self._pending_accounts}
+        temp = registry_path.with_suffix(".json.partial")
+        temp.write_text(json.dumps(saved, sort_keys=True), encoding="utf-8")
+        os.chmod(temp, 0o600)
+        temp.replace(registry_path)
+
+    def _ensure_managed_browser(self, account, *, headless=True):
+        with self._accounts_lock:
+            if self.stop_event.is_set():
+                raise ServiceError("WAN 服务正在停止。", 503)
+            process = self._browser_processes.get(account)
+            if process is not None and process.poll() is None:
+                if self._browser_modes.get(account) == headless:
+                    return
+                self._stop_browser(account)
+            executable = _browser_executable()
+            if executable is None:
+                raise ServiceError("未找到 Chrome 或 Chromium。请先安装浏览器后重试。", 503,
+                                   "browser_not_found")
+            profile = self.store.data_dir / "browser-profiles" / account
+            if not profile.is_dir():
+                raise ServiceError("账号的浏览器目录不存在，请恢复原目录。", 409)
+            # A managed endpoint is local and gets a new free port on each restart.
+            port = _free_cdp_port()
+            command = [str(executable), *(["--headless=new"] if headless else []), "--remote-debugging-address=127.0.0.1",
+                       f"--remote-debugging-port={port}", f"--user-data-dir={profile}",
+                       "--no-first-run", "--no-default-browser-check", "--window-size=1100,760",
+                       "https://modelscope.cn"]
+            try:
+                self._browser_processes[account] = subprocess.Popen(
+                    command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, start_new_session=(os.name != "nt"))
+                self._browser_modes[account] = headless
+            except OSError as exc:
+                raise ServiceError("无法启动登录浏览器，请重试。", 503, "browser_launch_failed") from exc
+            self.account_urls[account] = f"http://127.0.0.1:{port}"
+            self._save_browser_accounts()
+
+    def launch_browser_account(self, *, pending=False, headless=True):
+        executable = _browser_executable()
+        if executable is None:
+            raise ServiceError("未找到 Chrome 或 Chromium。请先安装浏览器后重试。", 503,
+                               "browser_not_found")
+        with self._accounts_lock:
+            index = 1
+            while (f"account-{index}" in self.account_urls or
+                   (self.store.data_dir / "browser-profiles" / f"account-{index}").exists()):
+                index += 1
+            account = f"account-{index}"
+            profile_dir = self.store.data_dir / "browser-profiles" / account
+            profile_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+            profile_dir.chmod(0o700)
+            self._pending_accounts.add(account)
+            self.account_urls[account] = "http://127.0.0.1:0"
+            self.accounts.append(account)
+            self.account_labels[account] = account
+            self._account_operations[account] = threading.Lock()
+            self.store.configure_accounts([account])
+            with self._profile_lock:
+                self.account_profiles[account] = {
+                    "id": account, "label": account, "balance": None, "unit": "魔粒",
+                    "status": "connecting", "checked_at": None, "balance_error": None,
+                    "session_error": "请在登录页面中完成 ModelScope 登录。"}
+            try:
+                self._ensure_managed_browser(account, headless=headless)
+                if not pending:
+                    self.activate_browser_account(account)
+            except Exception:
+                self.discard_pending_account(account)
+                raise
+        return self.account_snapshot(account)
+
+    def activate_browser_account(self, account):
+        with self._accounts_lock:
+            self._pending_accounts.discard(account)
+            self._save_browser_accounts()
+            self._start_account_worker(account)
+
+    def discard_pending_account(self, account):
+        with self._accounts_lock:
+            if account not in self._pending_accounts:
+                return
+            self._stop_browser(account)
+            self._pending_accounts.remove(account)
+            self.accounts.remove(account)
+            self.account_urls.pop(account, None)
+            self.account_labels.pop(account, None)
+            with self._profile_lock:
+                self.account_profiles.pop(account, None)
+            with self.store._connect() as db:
+                db.execute("DELETE FROM accounts WHERE id=?", (account,))
+            shutil.rmtree(self.store.data_dir / "browser-profiles" / account, ignore_errors=True)
+
+    def _stop_browser(self, account):
+        process = self._browser_processes.pop(account, None)
+        self._browser_modes.pop(account, None)
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
     def stop(self):
         self.stop_event.set()
+        self.logins.close()
+        for account in list(self._browser_processes):
+            self._stop_browser(account)
         for worker in self.workers:
             worker.join(timeout=3)
         self._service_lock.close()
@@ -815,27 +1005,38 @@ class WanService:
                 from playwright.sync_api import sync_playwright
 
                 with sync_playwright() as playwright:
-                    ms = ms_provider.connect(playwright, self.account_urls[account])
+                    if self.logins.is_active(account):
+                        self.stop_event.wait(1)
+                        continue
+                    if account not in self._startup_accounts:
+                        self._ensure_managed_browser(account)
+                    with self._account_operations[account]:
+                        if self.logins.is_active(account):
+                            continue
+                        ms = ms_provider.connect(playwright, self.account_urls[account])
                     refreshed_at = 0
                     while not self.stop_event.is_set():
-                        self.store.verify_identity(account, ms.identity())
-                        if time.monotonic() - refreshed_at >= 60:
-                            self._refresh_account(ms, account)
-                            refreshed_at = time.monotonic()
-                        job = self.store.next_for_account(account)
-                        if job:
-                            if job["status"] == "queued":
-                                self._submit_job(ms, job)
-                            elif job["status"] == "download_pending":
-                                if job.get("provider_url"):
-                                    self._download_job(job)
+                        with self._account_operations[account]:
+                            if self.logins.is_active(account):
+                                break
+                            self.store.verify_identity(account, ms.identity())
+                            if time.monotonic() - refreshed_at >= 60:
+                                self._refresh_account(ms, account)
+                                refreshed_at = time.monotonic()
+                            job = self.store.next_for_account(account)
+                            if job:
+                                if job["status"] == "queued":
+                                    self._submit_job(ms, job)
+                                elif job["status"] == "download_pending":
+                                    if job.get("provider_url"):
+                                        self._download_job(job)
+                                    else:
+                                        self._poll_job(ms, job)
                                 else:
                                     self._poll_job(ms, job)
-                            else:
-                                self._poll_job(ms, job)
-                            current = self.store.get(job["id"])
-                            if job["status"] == "queued" or current["status"] in ("completed", "failed"):
-                                refreshed_at = 0  # Refresh after submission or completion.
+                                current = self.store.get(job["id"])
+                                if job["status"] == "queued" or current["status"] in ("completed", "failed"):
+                                    refreshed_at = 0  # Refresh after submission or completion.
                         self.stop_event.wait(self.poll_seconds)
             except (Exception, SystemExit) as exc:
                 with self._profile_lock:
@@ -987,6 +1188,8 @@ def make_handler(service, token=None):
                 return self._json(200, {"status": "ok", "workers": len(service.workers)})
             if not self._check_auth():
                 return
+            if path.startswith("/v1/logins/"):
+                return self._json(200, service.logins.get(path.rsplit("/", 1)[-1]).snapshot())
             if path == "/v1/models":
                 return self._json(200, {"object": "list", "data": [
                     {"id": alias, "object": "model", "created": 0, "owned_by": "modelscope", "kind": "video"}
@@ -1060,6 +1263,33 @@ def make_handler(service, token=None):
         def do_POST(self):
             path = urlsplit(self.path).path
             parts = [unquote(part) for part in path.strip("/").split("/")]
+            if path == "/v1/logins" or (len(parts) == 4 and parts[:2] == ["v1", "logins"] and parts[3] == "cancel"):
+                if not self._check_auth():
+                    return
+                # Native clients omit Origin; browser requests must not create login sessions.
+                if self.headers.get("Origin"):
+                    return self._json(403, _error_payload("Use the Magpie login action."))
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if not 0 < length <= 4096:
+                        raise ValueError("Invalid login request")
+                    body = json.loads(self.rfile.read(length))
+                    if not isinstance(body, dict):
+                        raise ValueError("Invalid login request")
+                    if path == "/v1/logins":
+                        account = body.get("account")
+                        if account is not None and (not isinstance(account, str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}", account)):
+                            raise ValueError("Invalid account")
+                        return self._json(201, service.logins.create(account))
+                    task = service.logins.get(parts[2])
+                    task.end("cancelled", "已取消登录。")
+                    return self._json(200, task.snapshot())
+                except ServiceError as exc:
+                    return self._json(exc.status, _error_payload(exc, exc.code))
+                except ValueError:
+                    return self._json(400, _error_payload("Invalid login request"))
+            if path == "/v1/accounts/new":
+                return self._json(410, _error_payload("Use /v1/logins to verify login before saving an account."))
             is_submit = path == "/v1/videos"
             is_validate = path == "/v1/frames/validate"
             is_resolve = len(parts) == 4 and parts[:2] == ["v1", "videos"] and parts[3] == "resolve"
