@@ -165,16 +165,16 @@ def test_public_job_reports_project_request_actual_and_phases(tmp_path):
     frame = make_frame(tmp_path / "first.png")
     service = make_service(tmp_path)
     job, _ = service.submit({"prompt": "Camera move", "first_frame": str(frame), "seconds": 8,
-                             "size": "1280x720", "project": "MV one"})
+                             "size": "1280x720", "project": "Demo Project One"})
     queued = service.public_job(job)
     assert queued["execution_phase"] == "Waiting for an account worker"
     assert queued["requested"] == {"seconds": 8, "size": "1280x720", "width": 1280, "height": 720, "fps": None}
-    assert queued["project"] == "MV one"
+    assert queued["project"] == "Demo Project One"
     assert queued["prompt"] == "Camera move"
     service.store.update(job["id"], status="completed", actual_metadata='{"duration": 5.06, "width": 1280, "height": 736, "fps": 16.0}')
     actual = service.public_job(service.store.get(job["id"]))["actual"]
     assert actual == {"duration": 5.06, "width": 1280, "height": 736, "fps": 16.0, "frame_count": None}
-    assert service.store.list_jobs(project="MV one")[0]["id"] == job["id"]
+    assert service.store.list_jobs(project="Demo Project One")[0]["id"] == job["id"]
     assert service.store.list_jobs(project="another") == []
     service.stop()
 
@@ -422,7 +422,7 @@ def test_project_idempotency_account_selection_and_honest_progress(tmp_path):
     import time
     frame = make_frame(tmp_path / "first.png")
     service = make_service(tmp_path, {"a": "http://localhost:9223", "b": "http://localhost:9224"})
-    body = {"prompt": "Camera move", "first_frame": str(frame), "project": "MV", "shot": "Opening",
+    body = {"prompt": "Camera move", "first_frame": str(frame), "project": "Demo Project", "shot": "Opening",
             "idempotency_key": "opening", "account": "b"}
     job, _ = service.submit(body)
     assert job["account"] == "b"
@@ -450,7 +450,7 @@ def test_authenticated_config_preflight_pagination_and_frame_preview(tmp_path):
 
     frame = make_frame(tmp_path / "first.png")
     service = make_service(tmp_path)
-    jobs = [service.submit({"prompt": str(i), "first_frame": str(frame), "project": "MV"})[0]
+    jobs = [service.submit({"prompt": str(i), "first_frame": str(frame), "project": "Demo Project"})[0]
             for i in range(2)]
     server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(service, "test-token"))
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -465,8 +465,8 @@ def test_authenticated_config_preflight_pagination_and_frame_preview(tmp_path):
         valid = requests.post(base + "/v1/frames/validate", headers=headers, json={"first_frame": str(frame)}, timeout=3)
         assert valid.json()["valid"] is True
         assert len(service.store.list_jobs()) == 2
-        first = requests.get(base + "/v1/videos?project=MV&limit=1", headers=headers, timeout=3).json()
-        second = requests.get(base + f"/v1/videos?project=MV&limit=1&offset={first['next_offset']}", headers=headers, timeout=3).json()
+        first = requests.get(base + "/v1/videos?project=Demo%20Project&limit=1", headers=headers, timeout=3).json()
+        second = requests.get(base + f"/v1/videos?project=Demo%20Project&limit=1&offset={first['next_offset']}", headers=headers, timeout=3).json()
         assert first["data"][0]["id"] != second["data"][0]["id"]
         assert second["next_offset"] is None
         preview = requests.get(base + f"/v1/videos/{jobs[0]['id']}/frames/first_frame", headers=headers, timeout=3)

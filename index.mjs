@@ -10,7 +10,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { setTimeout as delay } from "node:timers/promises"
 
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
-const PLUGIN_VERSION = "0.1.0"
+const PLUGIN_VERSION = "0.0.2"
 const PROTOCOL_VERSION = 3
 
 function serviceUrl(options) {
@@ -368,7 +368,7 @@ export const MagpieVideoGenTools = async (input = {}, options = {}) => {
     auth: {
       provider: PROVIDER,
       icon,
-      options: [{ key: "balance_routing", label: "均衡负载（剩余魔粒最多优先）", default: true,
+      options: [{ key: "balance_routing", label: "VideoGen 均衡负载（剩余魔粒最多优先）", default: true,
         placement: "top", description: "开启后优先使用最新有效余额最多的账号；余额相同时选队列最短。关闭后使用 视频生成首选账号（未指定时按服务账号顺序）。" }],
       methods: [
         { type: "oauth", label: "登录新账号",
@@ -476,7 +476,7 @@ export const MagpieVideoGenTools = async (input = {}, options = {}) => {
         ]); return { ...media, ...accounts, usage_unit: "魔粒",
           routing: options.routing || "balanced", preferred_account: options.preferredAccount,
           generation_defaults: { accelerate_lora: { "minimax-h3": true, other_models: false }, accelerated_steps: 4, add_watermark: false },
-          routing_modes: { preferred: "首选账号", balanced: "均衡负载：剩余魔粒最多优先，余额相同选队列最短" } } } }),
+          routing_modes: { preferred: "首选账号", balanced: "VideoGen 均衡负载：剩余魔粒最多优先，余额相同选队列最短" } } } }),
       videogen_prepare_frames: tool({ description: "Validate frame paths before submitting; explicitly enable copying images outside allowed directories.",
         args: { first_frame: tool.schema.string().min(1), last_frame: tool.schema.string().optional(), copy_to_media_root: tool.schema.boolean().optional() },
         execute: (args, ctx = {}) => prepareFrames(args, options, ctx.abort) }),

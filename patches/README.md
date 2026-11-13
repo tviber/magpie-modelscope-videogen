@@ -50,8 +50,8 @@ source: `TestLaneLimitRoutes` sees leftover busy lanes and
 Focused wallet/history/report/core-budget tests, race checks and vet passed.
 The broad `usage-all-accounts.test.cjs` browser run stalled and was stopped;
 the 12 focused wallet/balance browser cases passed. No claim of a fully
-green native suite is made. Local app verified after restart with four real
-wallet histories and the folded 1,040 魔粒 total; WAN service remained healthy.
+green native suite is made. Local app verification after restart confirmed individual wallet histories
+and the combined total; the video service remained healthy.
 
 ## Plugin video submissions in Routing
 

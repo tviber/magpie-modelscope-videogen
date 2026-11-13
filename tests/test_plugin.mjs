@@ -220,7 +220,7 @@ test("result packages escaped preview, frame provenance, specifications and mani
   const { tool } = await fixture(t, (req, res) => {
     seen.push(req.url)
     if (req.url.endsWith("/content") || req.url.includes("/frames/")) return res.end("media fixture")
-    res.end(JSON.stringify({ id: "shot-1", status: "completed", project: "MV", shot: "Opening",
+    res.end(JSON.stringify({ id: "shot-1", status: "completed", project: "Demo Project", shot: "Opening",
       prompt: '<script>alert("unsafe")</script>', requested: { seconds: 8, size: "1280x720" },
       actual: { duration: 5.06, width: 1280, height: 736, fps: 16 }, spec_warnings: ["Duration mismatch"],
       estimate: 45, estimate_unit: "魔粒",
@@ -301,7 +301,7 @@ test("completion watcher resumes persisted tasks, downloads once and emits usefu
   const { createHash } = await import("node:crypto")
   const { outputDir, options: opts } = await fixture(t, (req, res) => {
     if (req.url.endsWith("/content")) return res.end("video fixture")
-    res.end(JSON.stringify({ id: "watched", status: "completed", project: "MV", shot: "Opening", prompt: "A steady camera",
+    res.end(JSON.stringify({ id: "watched", status: "completed", project: "Demo Project", shot: "Opening", prompt: "A steady camera",
       actual: { duration: 5.06, width: 1280, height: 736, fps: 16 }, input_frames: [] }))
   })
   const state = join(outputDir, `watch-${createHash("sha256").update(opts.serverUrl).digest("hex").slice(0, 24)}.json`)
@@ -405,7 +405,7 @@ test("operational tools send local controls and explicit reconciliation and chec
   const seen = []
   let protocol = 3
   const { tools } = await fixture(t, async (req, res) => {
-    if (req.url === '/health') return res.end(JSON.stringify({ protocol_version: protocol, service_version: '0.1.0' }))
+    if (req.url === '/health') return res.end(JSON.stringify({ protocol_version: protocol, service_version: '0.0.2' }))
     if (req.url === '/v1/diagnostics') return res.end('{"workers":[],"accounts":[],"affected_jobs":[]}')
     if (req.url === '/v1/models') return res.end('{"data":[{"id":"wan2.2-ti2v-5b"}]}')
     if (req.method === 'POST') {
