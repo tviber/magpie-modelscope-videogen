@@ -213,7 +213,7 @@ const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g, char => ({ "
 const hash = value => createHash("sha256").update(value).digest("hex").slice(0, 24)
 
 function resultRoot(options) {
-  const root = options?.outputDir || join(homedir(), ".magpie-wan", "results")
+  const root = options?.outputDir || join(homedir(), ".magpie-modelscope-videogen", "results")
   if (!isAbsolute(root)) throw new Error("video outputDir must be an absolute local directory")
   return root
 }

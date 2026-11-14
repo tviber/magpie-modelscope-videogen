@@ -94,9 +94,21 @@ def safe_provider_failure(stage, exc=None, payload=None):
         reason = reason[:400]
     code = payload.get("errorCode") or payload.get("code") or getattr(exc, "code", None)
     code = str(code) if isinstance(code, (str, int)) and re.fullmatch(r"[\w.-]{1,64}", str(code)) else None
+    constraint = None
+    if reason:
+        size_error = re.search(r"(width|height|dimension|resolution|size|pixel|edge|side|尺寸|分辨率|宽|高|边长)", reason, re.I)
+        maximum_error = re.search(r"(max(?:imum)?|greater than|exceed(?:s|ed)?|too large|超过|最大|上限)", reason, re.I)
+        if size_error and maximum_error:
+            constraint = {"type": "max_dimension"}
+            limit = re.search(r"(?:max(?:imum)?|limit|not exceed|exceed(?:s|ed)?|up to|上限|最大值|不超过|至多)"
+                              r"[^\d]{0,40}(\d{3,5})\s*(?:px|pixels?|像素)?", reason, re.I)
+            if limit:
+                constraint["maximum"] = int(limit.group(1))
+                constraint["source"] = "provider_error_message"
     return {"stage": stage, "provider_code": code, "provider_reason": reason,
             "reason_available": bool(reason),
             "message": reason or "服务端未提供原因。",
+            "constraint": constraint,
             "http_status": getattr(exc, "status", None) if isinstance(exc, ms_provider.ModelScopeAPIError) else None,
             "exception_type": type(exc).__name__ if exc else None}
 
@@ -112,13 +124,7 @@ class ServiceError(ValueError):
 def default_data_dir():
     if os.environ.get("WAN_SERVICE_DATA_DIR"):
         return Path(os.environ["WAN_SERVICE_DATA_DIR"]).expanduser()
-    if os.environ.get("XDG_DATA_HOME"):
-        return Path(os.environ["XDG_DATA_HOME"]).expanduser() / "magpie-wan"
-    if os.name == "nt":
-        return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local")) / "magpie-wan"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "magpie-wan"
-    return Path.home() / ".local" / "share" / "magpie-wan"
+    return Path.home() / ".magpie-modelscope-videogen"
 
 
 def parse_accounts(raw=None):
@@ -1064,7 +1070,22 @@ class WanService:
                             "connection_unavailable_seconds": max(0, int(now - result["connection"]["unavailable_since"]))
                             if result["connection"]["unavailable_since"] else None}
         result["failure"] = json.loads(job["failure_details"]) if job.get("failure_details") else None
-        result["recovery"] = {"safe_to_resubmit": internal_status == "failed" and not job.get("provider_task_id"),
+        safe_to_resubmit = internal_status == "failed" and not job.get("provider_task_id")
+        if job.get("provider_task_id"):
+            remote_task_created = True
+        elif internal_status in ("queued", "uploading", "paused", "cancelled"):
+            remote_task_created = False
+        elif internal_status == "failed" and result["failure"] and result["failure"].get("stage") in (
+                "upload", "request", "estimate", "submit"):
+            remote_task_created = False
+        else:
+            remote_task_created = None
+        result["recovery"] = {"safe_to_resubmit": safe_to_resubmit,
+                              "remote_task_created": remote_task_created,
+                              "charge_possible": remote_task_created,
+                              "retry_guidance": "reconcile_before_retry" if internal_status == "unknown_submission" else
+                              "inspect_existing_task" if job.get("provider_task_id") else
+                              "safe_to_resubmit" if safe_to_resubmit else None,
                               "action": "reconcile" if internal_status == "unknown_submission" else
                               "restore_account" if not terminal and unavailable else
                               "resume" if internal_status == "paused" else

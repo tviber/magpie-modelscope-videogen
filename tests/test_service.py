@@ -7,7 +7,7 @@ import pytest
 from PIL import Image
 
 from magpie_wan import provider
-from magpie_wan.service import ServiceError, WanService, _infer_dimensions, parse_accounts, parse_media_roots
+from magpie_wan.service import ServiceError, WanService, _infer_dimensions, default_data_dir, parse_accounts, parse_media_roots
 
 
 def make_frame(path, size=(320, 180), color=(24, 80, 160)):
@@ -80,6 +80,19 @@ def test_media_roots_must_be_explicit_and_exist(tmp_path, monkeypatch):
     with pytest.raises(ServiceError, match="existing directories"):
         parse_media_roots(str(tmp_path / "missing"))
     assert parse_media_roots(str(tmp_path)) == [tmp_path.resolve()]
+
+
+def test_default_data_dir_uses_dedicated_home_directory(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("WAN_SERVICE_DATA_DIR", raising=False)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    assert default_data_dir() == tmp_path / ".magpie-modelscope-videogen"
+
+
+def test_explicit_data_dir_override_is_preserved(tmp_path, monkeypatch):
+    target = tmp_path / "existing-data"
+    monkeypatch.setenv("WAN_SERVICE_DATA_DIR", str(target))
+    assert default_data_dir() == target
 
 
 def test_default_dimensions_keep_common_aspect_ratio(tmp_path):
@@ -813,6 +826,39 @@ def test_failure_details_are_stage_specific_and_do_not_dump_private_responses(tm
     client.status.return_value = {'status': 'FAILED'}
     service._poll_job(client, linked)
     assert '服务端未提供原因' in service.store.get(current['id'])['error']
+    service.stop()
+
+
+def test_failure_metadata_explains_remote_submission_and_size_constraint(tmp_path):
+    from unittest.mock import Mock
+
+    service = make_service(tmp_path)
+    frame = make_frame(tmp_path / 'frame.png')
+    client = Mock()
+    client.upload.return_value = 'first-url'
+    client.request.return_value = {'model': 'request'}
+    client.estimate.return_value = 10
+    client.submit.side_effect = provider.SubmissionRejected('Maximum dimension is 1280 pixels')
+    job = service.submit({'prompt': 'move', 'first_frame': str(frame), 'size': '1280x720'})[0]
+
+    service._submit_job(client, job)
+
+    public = service.job_details(service.store.get(job['id']))
+    assert public['failure']['constraint'] == {
+        'type': 'max_dimension', 'maximum': 1280, 'source': 'provider_error_message'}
+    assert public['recovery']['remote_task_created'] is False
+    assert public['recovery']['charge_possible'] is False
+    assert public['recovery']['safe_to_resubmit'] is True
+    assert public['recovery']['retry_guidance'] == 'safe_to_resubmit'
+
+    client.submit.side_effect = TimeoutError('response lost')
+    uncertain = service.submit({'prompt': 'turn', 'first_frame': str(frame), 'size': '1280x720'})[0]
+    service._submit_job(client, uncertain)
+    recovery = service.job_details(service.store.get(uncertain['id']))['recovery']
+    assert recovery['remote_task_created'] is None
+    assert recovery['charge_possible'] is None
+    assert recovery['safe_to_resubmit'] is False
+    assert recovery['retry_guidance'] == 'reconcile_before_retry'
     service.stop()
 
 
